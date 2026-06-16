@@ -22,6 +22,7 @@
 #include "phaseouts.h"
 #include "functions.h"
 #include "filter.h"
+#include "speed_controller.h"
 
 // include the headers for the generated DroneCAN messages from the
 // dronecan_dsdlc compiler
@@ -45,6 +46,24 @@ struct CANStats canstats;
 
 static bool dronecan_armed;
 static bool done_startup;
+
+/*
+  Input-mode arbitration between RawCommand and RPMCommand.
+
+  Rules:
+  1. The first command received after input_mode==NONE locks the mode.
+  2. The other channel is silently discarded while locked.
+  3. When the LOCKED channel times out (250ms silence):
+     input_mode → NONE, motor stops.
+     The next first frame locks the new mode.
+  4. RPM=0 stops the motor but does NOT unlock the mode (choice A).
+*/
+enum canInputMode {
+    INPUT_MODE_NONE = 0,
+    INPUT_MODE_RAW  = 1,
+    INPUT_MODE_RPM  = 2,
+};
+static enum canInputMode input_mode = INPUT_MODE_NONE;
 
 #define APP_SIGNATURE_MAGIC1 0x68f058e6
 #define APP_SIGNATURE_MAGIC2 0xafcee5a0
@@ -108,8 +127,8 @@ extern volatile uint32_t commutation_interval;
 extern uint8_t auto_advance_level;
 extern uint16_t low_cell_volt_cutoff;
 extern uint32_t desync_happened;
+extern SpeedController sc;
 
-static uint16_t last_can_input;
 static struct {
     uint32_t sum;
     uint32_t count;
@@ -173,6 +192,9 @@ static const struct parameter {
 #ifdef CAN_TERM_PIN
         { "CAN_TERM_ENABLE",        T_BOOL,  0, 1,   0, &eepromBuffer.can.term_enable},
 #endif
+        { "SPEED_KP",               T_UINT16,0, 100,  5, &sc.pid.Kp},
+        { "SPEED_KI",               T_UINT8, 0, 50,   1, &sc.pid.Ki},
+        { "SPEED_KD",               T_UINT16,0, 200, 50, &sc.pid.Kd},
         { "STARTUP_TUNE",           T_STRING,0, 4,   0, &eepromBuffer.tune},
 };
 
@@ -598,6 +620,7 @@ static void handle_GetNodeInfo(CanardInstance *ins, CanardRxTransfer *transfer)
 
 extern void transfercomplete();
 extern void setInput();
+extern void setRPM(void);
 
 
 /*
@@ -615,7 +638,6 @@ static void set_input(uint16_t input)
     const uint16_t filtered_input = Filter2P_apply(unfiltered_input, eepromBuffer.can.filter_hz, 1000);
 
     newinput = filtered_input;
-    last_can_input = unfiltered_input;
     inputSet = 1;
 
     // we must set dshot for bi_direction to work
@@ -646,10 +668,22 @@ static void handle_RawCommand(CanardInstance *ins, CanardRxTransfer *transfer)
     const int16_t input_can = cmd.cmd.data[(unsigned)eepromBuffer.can.esc_index];
 
     /*
-      we need to map onto the AM32 expected range, which is a 11 bit number, where:
-      0: off
-      1-46: special codes
-      48-2047: throttle
+      Arbitration: discard RawCommand when RPM mode is locked.
+     */
+    if (input_mode == INPUT_MODE_RPM) {
+        return;
+    }
+
+    /*
+      Lock mode on first Raw command after NONE.
+     */
+    if (input_mode == INPUT_MODE_NONE) {
+        input_mode = INPUT_MODE_RAW;
+    }
+
+    /*
+      Map RawCommand value (-8191…8191) to the 11-bit AM32 throttle range.
+      0: off, 1-46: special codes, 48-2047: throttle
     */
     uint16_t this_input = 0;
     if (input_can == 0) {
@@ -672,6 +706,49 @@ static void handle_RawCommand(CanardInstance *ins, CanardRxTransfer *transfer)
     canstats.last_raw_command_us = ts;
 
     set_input(this_input);
+}
+
+/*
+  handle a DroneCAN RPMCommand request.
+  Conforms to the DroneCAN uavcan.equipment.esc.RPMCommand spec:
+    rpm[]  =  int18  signed,  positive = forward,  zero = stop
+*/
+static void handle_RPMCommand(CanardInstance *ins, CanardRxTransfer *transfer)
+{
+    struct uavcan_equipment_esc_RPMCommand cmd;
+    if (uavcan_equipment_esc_RPMCommand_decode(transfer, &cmd)) {
+        return;
+    }
+    // see if it is for us
+    if (cmd.rpm.len <= eepromBuffer.can.esc_index) {
+        return;
+    }
+
+    const int32_t rpm_target = cmd.rpm.data[(unsigned)eepromBuffer.can.esc_index];
+
+    /*
+      Arbitration: discard RPMCommand when Raw mode is locked.
+     */
+    if (input_mode == INPUT_MODE_RAW) {
+        return;
+    }
+
+    /*
+      Lock mode on first RPM command after NONE.
+     */
+    if (input_mode == INPUT_MODE_NONE) {
+        input_mode = INPUT_MODE_RPM;
+    }
+
+    // CAN bookkeeping.  setRPM() is safe from IRQ context — it only
+    // writes atomic flags (uint8_t), and rpm_target_value (int32_t).
+    const uint64_t ts = micros64();
+    canstats.last_rpm_command_us = ts;
+    canstats.num_commands++;
+    canstats.total_commands++;
+
+    rpm_target_value = rpm_target;
+    setRPM();
 }
 
 /*
@@ -902,6 +979,10 @@ static void onTransferReceived(CanardInstance *ins, CanardRxTransfer *transfer)
             handle_RawCommand(ins, transfer);
             break;
         }
+        case UAVCAN_EQUIPMENT_ESC_RPMCOMMAND_ID: {
+            handle_RPMCommand(ins, transfer);
+            break;
+        }
         case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID: {
             handle_DNA_Allocation(ins, transfer);
             break;
@@ -961,6 +1042,10 @@ static bool shouldAcceptTransfer(const CanardInstance *ins,
         switch (data_type_id) {
         case UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID: {
             *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
+            return true;
+        }
+        case UAVCAN_EQUIPMENT_ESC_RPMCOMMAND_ID: {
+            *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RPMCOMMAND_SIGNATURE;
             return true;
         }
         case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID: {
@@ -1241,17 +1326,42 @@ void DroneCAN_update()
 
     DroneCAN_processTxQueue();
 
-    if (canstats.last_raw_command_us != 0 && ts - canstats.last_raw_command_us > 250000ULL) {
-        /*
-          we have stopped getting CAN RawCommand, zero input
-         */
-        canstats.last_raw_command_us = 0;
-        set_input(0);
+    /*
+      ── Timeout ─────────────────────────────────────────────────
+
+      Locked channel times out (250ms no frame) →
+        input_mode = NONE
+        set_input(0) — stop motor
+        Next first frame from either channel locks the new mode.
+     */
+
+    // ---- RawCommand timeout ----
+    if (input_mode != INPUT_MODE_RPM) {
+        if (canstats.last_raw_command_us != 0 && ts - canstats.last_raw_command_us > 250000ULL) {
+            canstats.last_raw_command_us = 0;
+            if (input_mode == INPUT_MODE_RAW) {
+                input_mode = INPUT_MODE_NONE;
+                // motor already stopped by set_input(0) below;
+                // input_mode lock prevents cross-channel oscillation.
+                // armed is preserved so the FC can resume immediately.
+            }
+            set_input(0);
+        }
     }
-    if (ts - canstats.last_raw_command_us > TARGET_PERIOD_US) {
-        // ensure at least 1kHz signal is seen by main code
-        set_input(last_can_input);
-        canstats.last_raw_command_us = ts;
+
+    // ---- RPMCommand timeout ----
+    if (input_mode == INPUT_MODE_RPM) {
+        if (ts - canstats.last_rpm_command_us > 250000ULL) {
+            // RPM timed out → exit RPM mode, stop motor
+            input_mode = INPUT_MODE_NONE;
+            rpm_command_active = 0;
+            drive_by_rpm = 0;
+            SC_Reset(&sc);
+            // motor already stopped by set_input(0) below;
+            // input_mode lock prevents cross-channel oscillation.
+            // armed is preserved so the FC can resume immediately.
+            set_input(0);
+        }
     }
 
     sys_can_enable_IRQ();

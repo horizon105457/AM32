@@ -21,6 +21,13 @@ extern uint16_t signaltimeout;
 extern uint16_t input;
 extern volatile uint16_t newinput;
 extern char play_tone_flag;
+extern uint8_t drive_by_rpm;
+extern uint8_t rpm_command_active;
+extern int32_t rpm_target_value;
+extern uint8_t rpm_target_pending;
+extern uint32_t MAXIMUM_RPM_SPEED_CONTROL;
+extern uint32_t MINIMUM_RPM_SPEED_CONTROL;
+
 extern uint32_t current_GPIO_PIN;
 extern char ic_timer_prescaler;
 extern uint8_t buffersize;
@@ -67,9 +74,9 @@ extern volatile char input_ready;
 
 typedef struct fastPID {
     int32_t error;
-    uint32_t Kp;
-    uint32_t Ki;
-    uint32_t Kd;
+    uint16_t Kp;
+    uint16_t Ki;
+    uint16_t Kd;
     int32_t integral;
     int32_t derivative;
     int32_t last_error;

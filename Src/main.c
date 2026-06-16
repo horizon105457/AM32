@@ -229,6 +229,7 @@ an settings option)
 #include "kiss_telemetry.h"
 #include "signal.h"
 #include "sounds.h"
+#include "speed_controller.h"
 #include "targets.h"
 #include <stdint.h>
 #include <string.h>
@@ -251,6 +252,7 @@ an settings option)
 #include <version.h>
 
 void zcfoundroutine(void);
+void setRPM(void);
 
 // firmware build options !! fixed speed and duty cycle modes are not to be used
 // with sinusoidal startup !!
@@ -276,17 +278,13 @@ void zcfoundroutine(void);
 //===========================================================================
 
 uint8_t drive_by_rpm = 0;
+uint8_t rpm_command_active = 0;       // set by DroneCAN RPMCommand handler
+int32_t rpm_target_value = 0;        // RPM target, set by DroneCAN handler, consumed by setRPM()
+uint8_t rpm_target_pending = 0;       // setRPM() flag, cleared by main loop after applying
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 10000;
 uint32_t MINIMUM_RPM_SPEED_CONTROL = 1000;
 
-// assign speed control PID values values are x10000
-fastPID speedPid = { // commutation speed loop time
-    .Kp = 10,
-    .Ki = 0,
-    .Kd = 100,
-    .integral_limit = 10000,
-    .output_limit = 50000
-};
+SpeedController sc;   // speed closed-loop controller
 
 fastPID currentPid = { // 1khz loop time
     .Kp = 400,
@@ -352,10 +350,7 @@ uint16_t ADC_CCR = 30;
 uint16_t current_angle = 90;
 uint16_t desired_angle = 90;
 char return_to_center = 0;
-uint16_t target_e_com_time = 0;
 int16_t Speed_pid_output;
-char use_speed_control_loop = 0;
-int32_t input_override = 0;
 int16_t use_current_limit_adjust = 2000;
 char use_current_limit = 0;
 int32_t stall_protection_adjust = 0;
@@ -936,15 +931,15 @@ void interruptRoutine()
 //            return;
 //        }
 //    }
-        for (int i = 0; i < filter_level; i++) {
+    for (int i = 0; i < filter_level; i++) {
 #if defined(MCU_F031) || defined(MCU_G031)
-            if (((current_GPIO_PORT->IDR & current_GPIO_PIN) == !(rising))) {
+        if (((current_GPIO_PORT->IDR & current_GPIO_PIN) == !(rising))) {
 #else
-            if (getCompOutputLevel() == rising) {
+        if (getCompOutputLevel() == rising) {
 #endif
-                return;
-            }
+            return;
         }
+    }
     __disable_irq();
     maskPhaseInterrupts();
     lastzctime = thiszctime;
@@ -963,6 +958,22 @@ void startMotor()
         running = 1;
     }
     enableCompInterrupts();
+}
+
+/*
+  Set RPM command target (called from DroneCAN IRQ context).
+
+  Mirrors set_input() / newinput pattern:
+  - Only writes flags and variables, does NOT perform any control operations.
+  - All writes are atomic (uint8_t / int32_t) on Cortex-M4.
+  - Direction switching, PID target anchoring, and input/duty assignment
+    are deferred to the main-loop 1kHz block (rpm_target_pending).
+ */
+void setRPM(void)
+{
+    drive_by_rpm = 1;
+    rpm_command_active = (rpm_target_value != 0);
+    rpm_target_pending = 1;
 }
 
 void setInput()
@@ -1135,7 +1146,10 @@ void setInput()
 #ifdef FIXED_DUTY_MODE
         input = FIXED_DUTY_MODE_POWER * 20 + 47;
 #else
-        if (eepromBuffer.use_sine_start) {
+        if (drive_by_rpm) {
+            /* RPM mode: read PID output (bypasses sine_start mapping) */
+            input = SC_GetOutput(&sc);
+        } else if (eepromBuffer.use_sine_start) {
             if (adjusted_input < 30) { // dead band ?
                 input = 0;
             }
@@ -1148,36 +1162,7 @@ void setInput()
                     2047, 160, 2047);
             }
         } else {
-            if (use_speed_control_loop) {
-                if (drive_by_rpm) {
-                    target_e_com_time = 60000000 / map(adjusted_input, 47, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL) / (eepromBuffer.motor_poles / 2);
-                    if (adjusted_input < 47) { // dead band ?
-                        input = 0;
-                        speedPid.error = 0;
-                        input_override = 0;
-                    } else {
-                        input = (uint16_t)(input_override / 10000); // speed control pid override
-                        if (input > 2047) {
-                            input = 2047;
-                        }
-                        if (input < 48) {
-                            input = 48;
-                        }
-                    }
-                } else {
-
-                    input = (uint16_t)(input_override / 10000); // speed control pid override
-                    if (input > 2047) {
-                        input = 2047;
-                    }
-                    if (input < 48) {
-                        input = 48;
-                    }
-                }
-            } else {
-
-                input = adjusted_input;
-            }
+            input = adjusted_input;
         }
 #endif
     }
@@ -1443,18 +1428,71 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running) {
-                input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
-                if (input_override > 2047 * 10000) {
-                    input_override = 2047 * 10000;
+        /*
+         * ── RPM target application (deferred from setRPM()) ──
+         * Processed at 1kHz alongside SC_Update.  setRPM() only
+         * writes flags from DroneCAN context; all control operations
+         * (direction switching, PID anchoring) are deferred here.
+         */
+        if (rpm_target_pending) {
+            rpm_target_pending = 0;
+            if (rpm_target_value == 0) {
+                rpm_command_active = 0;
+                drive_by_rpm = 0;
+                SC_Reset(&sc);
+                input = 0;
+            } else {
+                int8_t desired_dir;
+                uint32_t rpm_abs;
+                if (rpm_target_value > 0) {
+                    desired_dir = 1 - eepromBuffer.dir_reversed;
+                    rpm_abs = (uint32_t)rpm_target_value;
+                } else {
+                    desired_dir = eepromBuffer.dir_reversed;
+                    rpm_abs = (uint32_t)(-rpm_target_value);
                 }
-                if (input_override < 0) {
-                    input_override = 0;
-                }
-                if (zero_crosses < 100) {
-                    speedPid.integral = 0;
+                if (rpm_abs < MINIMUM_RPM_SPEED_CONTROL) {
+                    rpm_command_active = 0;
+                    drive_by_rpm = 0;
+                    SC_Reset(&sc);
+                    input = 0;
+                } else {
+                    if (rpm_abs > MAXIMUM_RPM_SPEED_CONTROL) {
+                        rpm_abs = MAXIMUM_RPM_SPEED_CONTROL;
+                    }
+                    uint8_t dir_ok = 1;
+                    if (desired_dir != forward) {
+                        if ((commutation_interval > reverse_speed_threshold && duty_cycle < 200)
+                            || stepper_sine)
+                        {
+                            forward = desired_dir;
+                            zero_crosses = 0;
+                            old_routine = 1;
+                            maskPhaseInterrupts();
+                        } else {
+                            dir_ok = 0;
+                            input = 0;
+                        }
+                    }
+                    if (dir_ok) {
+                        uint16_t target = 60000000U / rpm_abs / (eepromBuffer.motor_poles / 2);
+                        SC_SetTarget(&sc, target);
+                        rpm_command_active = 1;
+                    }
                 }
             }
+        }
+#if defined(FIXED_SPEED_MODE) || !defined(BRUSHED_MODE)
+            if (running
+#ifdef FIXED_SPEED_MODE
+                ) {
+#else
+                && rpm_command_active) {
+#endif
+                SC_Update(&sc, e_com_time, running, zero_crosses);
+                duty_cycle_setpoint = map(SC_GetOutput(&sc), 47, 2047, minimum_duty_cycle, 2000);
+            }
+#endif
         }
         if (ramp_count > ramp_divider) {
           ramp_count = 0;
@@ -1763,6 +1801,8 @@ int main(void)
     loadEEpromSettings();
 #endif
 
+    SC_Init(&sc);
+
     if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor || EEPROM_VERSION > eepromBuffer.eeprom_version) {
         eepromBuffer.version.major = VERSION_MAJOR;
         eepromBuffer.version.minor = VERSION_MINOR;
@@ -1826,9 +1866,8 @@ int main(void)
     newinput = 48;
 		comStep(2);
 #ifdef FIXED_SPEED_MODE
-    use_speed_control_loop = 1;
     eepromBuffer.use_sine_start = 0;
-    target_e_com_time = 60000000 / FIXED_SPEED_MODE_RPM / (eepromBuffer.motor_poles / 2);
+    SC_SetTarget(&sc, 60000000 / FIXED_SPEED_MODE_RPM / (eepromBuffer.motor_poles / 2));
     input = 48;
 #endif
 
@@ -1861,9 +1900,6 @@ int main(void)
 #else
     // checkForHighSignal();     // will reboot if signal line is high for 10ms
     receiveDshotDma();
-    if (drive_by_rpm) {
-        use_speed_control_loop = 1;
-    }
 #endif
 
 #endif // end fixed duty mode ifdef
