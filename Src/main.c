@@ -1058,14 +1058,18 @@ static void rpm_update_throttle(void)
     }
 }
 
-void setInput()
+/* -- RPM preempt: RAW input steals control from RPM ------------------- */
+static inline void rpm_preempt(void)
 {
-    /* RPM 模式抢占：任何 RAW 输入自动夺取控制权 */
     if (rpm_command_active) {
         rpm_command_active = 0;
         SC_Reset(&sc);
     }
+}
 
+/* -- Direction: bi-dir (dshot / servo × RC-car / normal) or single ---- */
+static inline void process_direction(void)
+{
     if (eepromBuffer.bi_direction) {
         if (dshot == 0) {
             if (eepromBuffer.rc_car_reverse) {
@@ -1221,7 +1225,11 @@ void setInput()
     } else {
         adjusted_input = newinput;
     }
-#ifndef BRUSHED_MODE
+}
+
+/* -- Stuck rotor + adjusted_input → input mapping -------------------- */
+static inline void process_stuck_rotor(void)
+{
     if ((bemf_timeout_happened > bemf_timeout) && eepromBuffer.stuck_rotor_protection) {
         allOff();
         maskPhaseInterrupts();
@@ -1251,132 +1259,145 @@ void setInput()
         }
 #endif
     }
-#endif
-#ifndef BRUSHED_MODE
-if (!stepper_sine && armed) {
-        if (input >= 47 + (80 * eepromBuffer.use_sine_start)) {
-            if (running == 0) {
-                allOff();
-                if (!old_routine) {
-                    startMotor();
-                }
-                running = 1;
-                last_duty_cycle = min_startup_duty;
-            }
+}
 
-            if (eepromBuffer.use_sine_start) {
-                duty_cycle_setpoint = map(input, 137, 2047, minimum_duty_cycle+40, 2000);
-            } else {
-                duty_cycle_setpoint = map(input, 47, 2047, minimum_duty_cycle, 2000);
+/* -- Motor start / stop: duty-cycle, brake, sine  -------------------- */
+static inline void process_motor_throttle(void)
+{
+    if (input >= 47 + (80 * eepromBuffer.use_sine_start)) {
+        if (running == 0) {
+            allOff();
+            if (!old_routine) {
+                startMotor();
             }
-
-            if (!eepromBuffer.rc_car_reverse) {
-                prop_brake_active = 0;
-            }
+            running = 1;
+            last_duty_cycle = min_startup_duty;
         }
 
-        if (input < 47 + (80 * eepromBuffer.use_sine_start)) {
-            if (play_tone_flag != 0) {
-                switch (play_tone_flag) {
-									
-                case 1:
-                    playDefaultTone();
-                    break;
-                case 2:
-                    playChangedTone();
-                    break;
-                case 3:
-                    playBeaconTune3();
-                    break;
-                case 4:
-                    playInputTune2();
-                    break;
-                case 5:
-                    playDefaultTone();
-                    break;
-                }
-                play_tone_flag = 0;
+        if (eepromBuffer.use_sine_start) {
+            duty_cycle_setpoint = map(input, 137, 2047, minimum_duty_cycle+40, 2000);
+        } else {
+            duty_cycle_setpoint = map(input, 47, 2047, minimum_duty_cycle, 2000);
+        }
+
+        if (!eepromBuffer.rc_car_reverse) {
+            prop_brake_active = 0;
+        }
+    }
+
+    if (input < 47 + (80 * eepromBuffer.use_sine_start)) {
+        if (play_tone_flag != 0) {
+            switch (play_tone_flag) {
+
+            case 1:
+                playDefaultTone();
+                break;
+            case 2:
+                playChangedTone();
+                break;
+            case 3:
+                playBeaconTune3();
+                break;
+            case 4:
+                playInputTune2();
+                break;
+            case 5:
+                playDefaultTone();
+                break;
             }
+            play_tone_flag = 0;
+        }
 
-            if (!eepromBuffer.comp_pwm) {
-                duty_cycle_setpoint = 0;
-                if (!running) {
-                    old_routine = 1;
-                    zero_crosses = 0;
-                    if (eepromBuffer.brake_on_stop) {
-                        fullBrake();
-                    } else {
-                        if (!prop_brake_active) {
-                            allOff();
-                        }
-                    }
-                }
-                if (eepromBuffer.rc_car_reverse && prop_brake_active) {
-#ifndef PWM_ENABLE_BRIDGE
-
-                  if (dshot == 0) prop_brake_duty_cycle = (getAbsDif(1000, newinput) + 1000);
-                    if (dshot)  {
-                        if (newinput <= 1047 && newinput > 47) prop_brake_duty_cycle = ((newinput - 48) * 2 + 47) - reversing_dead_band;
-                        if (newinput > 1047) prop_brake_duty_cycle = ((newinput - 1048) * 2 + 47) - reversing_dead_band;
-                    }
-                    if (prop_brake_duty_cycle >= (1999)) {
-
-                        fullBrake();
-                    } else {
-                        proportionalBrake();
-                    }
-#endif
-                }
-            } else {
-                if (!running) {
-
-                    old_routine = 1;
-                    zero_crosses = 0;
-                    bad_count = 0;
-                    if (eepromBuffer.brake_on_stop > 0) {
-                        if (!eepromBuffer.use_sine_start) {
-#ifndef PWM_ENABLE_BRIDGE
-                          if(eepromBuffer.brake_on_stop == 1){
-                             prop_brake_duty_cycle =  eepromBuffer.drag_brake_strength * 200;
-                              if (prop_brake_duty_cycle >= (1999)) {
-                                fullBrake();
-                              } else {
-                                proportionalBrake();
-                                prop_brake_active = 1;
-                              }
-                           }
-#else
-                            // todo add proportional braking for pwm/enable style bridge.
-#endif
-                        }
-                    } else {
+        if (!eepromBuffer.comp_pwm) {
+            duty_cycle_setpoint = 0;
+            if (!running) {
+                old_routine = 1;
+                zero_crosses = 0;
+                if (eepromBuffer.brake_on_stop) {
+                    fullBrake();
+                } else {
+                    if (!prop_brake_active) {
                         allOff();
                     }
-                    duty_cycle_setpoint = 0;
                 }
+            }
+            if (eepromBuffer.rc_car_reverse && prop_brake_active) {
+#ifndef PWM_ENABLE_BRIDGE
 
-                phase_A_position = ((step - 1) * 60) + enter_sine_angle;
-                if (phase_A_position > 359) {
-                    phase_A_position -= 360;
+              if (dshot == 0) prop_brake_duty_cycle = (getAbsDif(1000, newinput) + 1000);
+                if (dshot)  {
+                    if (newinput <= 1047 && newinput > 47) prop_brake_duty_cycle = ((newinput - 48) * 2 + 47) - reversing_dead_band;
+                    if (newinput > 1047) prop_brake_duty_cycle = ((newinput - 1048) * 2 + 47) - reversing_dead_band;
                 }
-                phase_B_position = phase_A_position + 119;
-                if (phase_B_position > 359) {
-                    phase_B_position -= 360;
-                }
-                phase_C_position = phase_A_position + 239;
-                if (phase_C_position > 359) {
-                    phase_C_position -= 360;
-                }
+                if (prop_brake_duty_cycle >= (1999)) {
 
-                if (eepromBuffer.use_sine_start == 1) {
-                    stepper_sine = 1;
+                    fullBrake();
+                } else {
+                    proportionalBrake();
+                }
+#endif
+            }
+        } else {
+            if (!running) {
+
+                old_routine = 1;
+                zero_crosses = 0;
+                bad_count = 0;
+                if (eepromBuffer.brake_on_stop > 0) {
+                    if (!eepromBuffer.use_sine_start) {
+#ifndef PWM_ENABLE_BRIDGE
+                      if(eepromBuffer.brake_on_stop == 1){
+                         prop_brake_duty_cycle =  eepromBuffer.drag_brake_strength * 200;
+                          if (prop_brake_duty_cycle >= (1999)) {
+                            fullBrake();
+                          } else {
+                            proportionalBrake();
+                            prop_brake_active = 1;
+                          }
+                       }
+#else
+                        // todo add proportional braking for pwm/enable style bridge.
+#endif
+                    }
+                } else {
+                    allOff();
                 }
                 duty_cycle_setpoint = 0;
             }
+
+            phase_A_position = ((step - 1) * 60) + enter_sine_angle;
+            if (phase_A_position > 359) {
+                phase_A_position -= 360;
+            }
+            phase_B_position = phase_A_position + 119;
+            if (phase_B_position > 359) {
+                phase_B_position -= 360;
+            }
+            phase_C_position = phase_A_position + 239;
+            if (phase_C_position > 359) {
+                phase_C_position -= 360;
+            }
+
+            if (eepromBuffer.use_sine_start == 1) {
+                stepper_sine = 1;
+            }
+            duty_cycle_setpoint = 0;
         }
-        if (!prop_brake_active) {
-            duty_cycle_setpoint = clamp_duty_cycle(duty_cycle_setpoint, input);
-        }
+    }
+    if (!prop_brake_active) {
+        duty_cycle_setpoint = clamp_duty_cycle(duty_cycle_setpoint, input);
+    }
+}
+
+/* -- setInput: sequenced stages -------------------------------------- */
+void setInput(void)
+{
+    rpm_preempt();
+    process_direction();
+#ifndef BRUSHED_MODE
+    process_stuck_rotor();
+    if (!stepper_sine && armed) {
+        process_motor_throttle();
     }
 #endif
 }
