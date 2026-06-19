@@ -277,7 +277,6 @@ void setRPM(void);
 //=============================  Defaults =============================
 //===========================================================================
 
-uint8_t drive_by_rpm = 0;
 uint8_t rpm_command_active = 0;       // set by DroneCAN RPMCommand handler
 int32_t rpm_target_value = 0;        // RPM target, set by DroneCAN handler, consumed by setRPM()
 uint8_t rpm_target_pending = 0;       // setRPM() flag, cleared by main loop after applying
@@ -316,8 +315,6 @@ uint16_t ramp_count;
 uint32_t process_time = 0;
 uint32_t start_process = 0;
 uint16_t one_khz_loop_counter = 0;
-uint16_t target_e_com_time_high;
-uint16_t target_e_com_time_low;
 volatile uint8_t compute_dshot_flag = 0;
 uint8_t crsf_input_channel = 1;
 uint8_t crsf_output_PWM_channel = 2;
@@ -610,6 +607,12 @@ void loadEEpromSettings()
       eepromBuffer.reserved_eeprom_3[1] = 0;
       eepromBuffer.reserved_eeprom_3[2] = 0;
       eepromBuffer.reserved_eeprom_3[3] = 0;
+      eepromBuffer.spd.speed_kp         = SC_DEFAULT_KP;
+      eepromBuffer.spd.speed_ki         = SC_DEFAULT_KI;
+      eepromBuffer.spd.speed_kd         = SC_DEFAULT_KD;
+      eepromBuffer.spd.speed_ff_kdrag   = SC_DEFAULT_KDRAG;
+      eepromBuffer.spd.speed_adapt_lo   = SC_DEFAULT_ADAPT_LOW / 100;
+      eepromBuffer.spd.speed_adapt_hi   = SC_DEFAULT_ADAPT_HIGH / 100;
     }
     // eepromBuffer.advance_level can either be set to 0-3 with config tools less than 1.90 or 10-42 with 1.90 or above 
     if (eepromBuffer.advance_level > 42 || (eepromBuffer.advance_level < 10 && eepromBuffer.advance_level > 3)){
@@ -971,13 +974,89 @@ void startMotor()
  */
 void setRPM(void)
 {
-    drive_by_rpm = 1;
-    rpm_command_active = (rpm_target_value != 0);
-    rpm_target_pending = 1;
+    if (rpm_target_value == 0) {
+        /* 停车 — 全部在 IRQ 中完成 */
+        rpm_command_active = 0;
+        SC_Reset(&sc);
+        duty_cycle_setpoint = 0;
+        rpm_target_pending = 0;
+    } else {
+        int8_t desired_dir;
+        uint32_t rpm_abs;
+        if (rpm_target_value > 0) {
+            desired_dir = 1 - eepromBuffer.dir_reversed;
+            rpm_abs = (uint32_t)rpm_target_value;
+        } else {
+            desired_dir = eepromBuffer.dir_reversed;
+            rpm_abs = (uint32_t)(-rpm_target_value);
+        }
+
+        if (rpm_abs < MINIMUM_RPM_SPEED_CONTROL) {
+            /* 低于最低转速当作停车 */
+            rpm_command_active = 0;
+            SC_Reset(&sc);
+            duty_cycle_setpoint = 0;
+            rpm_target_pending = 0;
+        } else {
+            if (rpm_abs > MAXIMUM_RPM_SPEED_CONTROL) {
+                rpm_abs = MAXIMUM_RPM_SPEED_CONTROL;
+            }
+            uint8_t pp_half = eepromBuffer.motor_poles / 2;
+            if (pp_half < 1) pp_half = 1;
+            uint16_t target = 60000000U / rpm_abs / pp_half;
+            SC_SetTarget(&sc, target);
+
+            rpm_command_active = 1;
+            /* 方向一致时无需 1kHz 处理 */
+            rpm_target_pending = (desired_dir != forward);
+        }
+    }
+}
+
+/*
+  内部函数：读取 SC PID 输出并写入油门链。
+  每次 SC_Update 后调用 (1kHz 周期)。
+  电机启动自包含，启动逻辑与 setInput() 下半段同源。
+ */
+static void rpm_update_throttle(void)
+{
+    uint16_t raw = SC_GetOutput(&sc);
+    input = raw;
+    if (raw >= 47) {
+        if (!running) {
+            allOff();
+            startMotor();
+            running = 1;
+            last_duty_cycle = min_startup_duty;
+        }
+        duty_cycle_setpoint = map(raw, 47, 2047, minimum_duty_cycle, 2000);
+        prop_brake_active = 0;
+        if (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
+            if (duty_cycle_setpoint < min_startup_duty)
+                duty_cycle_setpoint = min_startup_duty;
+            if (duty_cycle_setpoint > startup_max_duty_cycle)
+                duty_cycle_setpoint = startup_max_duty_cycle;
+        }
+        if (duty_cycle_setpoint > duty_cycle_maximum)
+            duty_cycle_setpoint = duty_cycle_maximum;
+        if (use_current_limit &&
+            duty_cycle_setpoint > use_current_limit_adjust)
+            duty_cycle_setpoint = use_current_limit_adjust;
+        if (stall_protection_adjust > 0)
+            duty_cycle_setpoint += (uint16_t)(stall_protection_adjust / 10000);
+    } else {
+        duty_cycle_setpoint = 0;
+    }
 }
 
 void setInput()
 {
+    /* RPM 模式抢占：任何 RAW 输入自动夺取控制权 */
+    if (rpm_command_active) {
+        rpm_command_active = 0;
+        SC_Reset(&sc);
+    }
+
     if (eepromBuffer.bi_direction) {
         if (dshot == 0) {
             if (eepromBuffer.rc_car_reverse) {
@@ -1146,10 +1225,7 @@ void setInput()
 #ifdef FIXED_DUTY_MODE
         input = FIXED_DUTY_MODE_POWER * 20 + 47;
 #else
-        if (drive_by_rpm) {
-            /* RPM mode: read PID output (bypasses sine_start mapping) */
-            input = SC_GetOutput(&sc);
-        } else if (eepromBuffer.use_sine_start) {
+        if (eepromBuffer.use_sine_start) {
             if (adjusted_input < 30) { // dead band ?
                 input = 0;
             }
@@ -1429,68 +1505,43 @@ void tenKhzRoutine()
                 }
             }
         /*
-         * ── RPM target application (deferred from setRPM()) ──
-         * Processed at 1kHz alongside SC_Update.  setRPM() only
-         * writes flags from DroneCAN context; all control operations
-         * (direction switching, PID anchoring) are deferred here.
+         * ── RPM 换向处理 (方向冲突时) ──
+         * setRPM() 已完成 SC_SetTarget 和停车。
+         * 此处仅处理 maskPhaseInterrupts 等 1kHz 安全操作。
          */
         if (rpm_target_pending) {
             rpm_target_pending = 0;
-            if (rpm_target_value == 0) {
-                rpm_command_active = 0;
-                drive_by_rpm = 0;
-                SC_Reset(&sc);
-                input = 0;
+
+            int8_t desired_dir;
+            if (rpm_target_value > 0) {
+                desired_dir = 1 - eepromBuffer.dir_reversed;
             } else {
-                int8_t desired_dir;
-                uint32_t rpm_abs;
-                if (rpm_target_value > 0) {
-                    desired_dir = 1 - eepromBuffer.dir_reversed;
-                    rpm_abs = (uint32_t)rpm_target_value;
+                desired_dir = eepromBuffer.dir_reversed;
+            }
+
+            if (desired_dir != forward) {
+                if ((commutation_interval > reverse_speed_threshold && duty_cycle < 200)
+                    || stepper_sine)
+                {
+                    forward = desired_dir;
+                    zero_crosses = 0;
+                    old_routine = 1;
+                    maskPhaseInterrupts();
+                    SC_Reset(&sc);  /* PID 重置，observer 重启 */
                 } else {
-                    desired_dir = eepromBuffer.dir_reversed;
-                    rpm_abs = (uint32_t)(-rpm_target_value);
-                }
-                if (rpm_abs < MINIMUM_RPM_SPEED_CONTROL) {
-                    rpm_command_active = 0;
-                    drive_by_rpm = 0;
-                    SC_Reset(&sc);
-                    input = 0;
-                } else {
-                    if (rpm_abs > MAXIMUM_RPM_SPEED_CONTROL) {
-                        rpm_abs = MAXIMUM_RPM_SPEED_CONTROL;
-                    }
-                    uint8_t dir_ok = 1;
-                    if (desired_dir != forward) {
-                        if ((commutation_interval > reverse_speed_threshold && duty_cycle < 200)
-                            || stepper_sine)
-                        {
-                            forward = desired_dir;
-                            zero_crosses = 0;
-                            old_routine = 1;
-                            maskPhaseInterrupts();
-                        } else {
-                            dir_ok = 0;
-                            input = 0;
-                        }
-                    }
-                    if (dir_ok) {
-                        uint16_t target = 60000000U / rpm_abs / (eepromBuffer.motor_poles / 2);
-                        SC_SetTarget(&sc, target);
-                        rpm_command_active = 1;
-                    }
+                    rpm_target_pending = 1;  /* 下次重试 */
                 }
             }
         }
-#if defined(FIXED_SPEED_MODE) || !defined(BRUSHED_MODE)
-            if (running
 #ifdef FIXED_SPEED_MODE
-                ) {
-#else
-                && rpm_command_active) {
-#endif
-                SC_Update(&sc, e_com_time, running, zero_crosses);
+            if (running) {
+                SC_Update(&sc, e_com_time, (int)commutation_interval, running, zero_crosses);
                 duty_cycle_setpoint = map(SC_GetOutput(&sc), 47, 2047, minimum_duty_cycle, 2000);
+            }
+#elif !defined(BRUSHED_MODE)
+            if (rpm_command_active) {
+                SC_Update(&sc, e_com_time, (int)commutation_interval, running, zero_crosses);
+                rpm_update_throttle();           /* 内部油门写入 */
             }
 #endif
         }
@@ -1802,6 +1853,10 @@ int main(void)
 #endif
 
     SC_Init(&sc);
+
+    if (eepromBuffer.eeprom_version >= 4) {
+        SC_RestoreFromEeprom(&sc);
+    }
 
     if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor || EEPROM_VERSION > eepromBuffer.eeprom_version) {
         eepromBuffer.version.major = VERSION_MAJOR;

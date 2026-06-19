@@ -21,7 +21,6 @@ extern uint16_t signaltimeout;
 extern uint16_t input;
 extern volatile uint16_t newinput;
 extern char play_tone_flag;
-extern uint8_t drive_by_rpm;
 extern uint8_t rpm_command_active;
 extern int32_t rpm_target_value;
 extern uint8_t rpm_target_pending;
@@ -59,18 +58,6 @@ extern uint16_t send_extended_dshot;
 #if defined(NEED_INPUT_READY) || defined(NXP)
 extern volatile char input_ready;
 #endif
-// typedef struct PID{
-//	float error;
-//	float Kp;
-//	float Ki;
-//	float Kd;
-//	float integral;
-//	float derivative;
-//	float last_error;
-//	float pid_output;
-//	int16_t integral_limit;
-//	int16_t output_limit;
-// }PID;
 
 typedef struct fastPID {
     int32_t error;

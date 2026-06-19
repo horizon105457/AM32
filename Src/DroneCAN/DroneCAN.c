@@ -192,9 +192,12 @@ static const struct parameter {
 #ifdef CAN_TERM_PIN
         { "CAN_TERM_ENABLE",        T_BOOL,  0, 1,   0, &eepromBuffer.can.term_enable},
 #endif
-        { "SPEED_KP",               T_UINT16,0, 100,  5, &sc.pid.Kp},
-        { "SPEED_KI",               T_UINT8, 0, 50,   1, &sc.pid.Ki},
-        { "SPEED_KD",               T_UINT16,0, 200, 50, &sc.pid.Kd},
+        { "SPEED_KP",               T_UINT16,0, 100,  8, &sc.pid.Kp},
+        { "SPEED_KI",               T_UINT16,0, 100,  3, &sc.pid.Ki},
+        { "SPEED_KD",               T_UINT16,0, 200, 60, &sc.pid.Kd},
+        { "SPEED_FF_KDRAG",         T_UINT16,0, 65535, 4640, &sc.k_drag},
+        { "SPEED_ADAPT_LO",         T_UINT16,100,10000,2500, &sc.adapt_low_ecom},
+        { "SPEED_ADAPT_HI",         T_UINT16,200,20000,6000, &sc.adapt_high_ecom},
         { "STARTUP_TUNE",           T_STRING,0, 4,   0, &eepromBuffer.tune},
 };
 
@@ -230,7 +233,13 @@ static void load_settings(void)
                 }
                 break;
             }
-            case T_UINT16:
+            case T_UINT16: {
+                uint16_t *pvalue = (uint16_t *)p->ptr;
+                if (*pvalue < p->min_value || *pvalue > p->max_value) {
+                    *pvalue = p->default_value;
+                }
+                break;
+            }
             case T_STRING:
                 break;
         }
@@ -380,11 +389,26 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
             }
             case T_UINT16: {
                 uint16_t *ptr16 = (uint16_t *)p->ptr;
-                *ptr16 = req.value.integer_value;
+                uint16_t val = (uint16_t)req.value.integer_value;
+                if (val < p->min_value)  val = p->min_value;
+                if (val > p->max_value)  val = p->max_value;
+                *ptr16 = val;
                 if (ptr16 == &motor_kv) {
                     eepromBuffer.motor_kv = (uint8_t)((*(uint16_t *)p->ptr - 20) / 40);
                 } else if (ptr16 == &low_cell_volt_cutoff) {
                     eepromBuffer.low_cell_volt_cutoff = (uint8_t)(*ptr16 - 250);
+                } else if (ptr16 == &sc.pid.Kp) {
+                    eepromBuffer.spd.speed_kp = (uint8_t)val;
+                } else if (ptr16 == &sc.pid.Ki) {
+                    eepromBuffer.spd.speed_ki = (uint8_t)val;
+                } else if (ptr16 == &sc.pid.Kd) {
+                    eepromBuffer.spd.speed_kd = (uint8_t)val;
+                } else if (ptr16 == &sc.k_drag) {
+                    eepromBuffer.spd.speed_ff_kdrag = val;
+                } else if (ptr16 == &sc.adapt_low_ecom) {
+                    eepromBuffer.spd.speed_adapt_lo = (uint8_t)(val / 100);
+                } else if (ptr16 == &sc.adapt_high_ecom) {
+                    eepromBuffer.spd.speed_adapt_hi = (uint8_t)(val / 100);
                 }
                 break;
             }
@@ -1354,12 +1378,6 @@ void DroneCAN_update()
         if (ts - canstats.last_rpm_command_us > 250000ULL) {
             // RPM timed out → exit RPM mode, stop motor
             input_mode = INPUT_MODE_NONE;
-            rpm_command_active = 0;
-            drive_by_rpm = 0;
-            SC_Reset(&sc);
-            // motor already stopped by set_input(0) below;
-            // input_mode lock prevents cross-channel oscillation.
-            // armed is preserved so the FC can resume immediately.
             set_input(0);
         }
     }

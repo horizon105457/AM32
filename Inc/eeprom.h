@@ -68,10 +68,19 @@ typedef union EEprom_u {
             uint8_t filter_hz; // 181
             uint8_t debug_rate; // 182
             uint8_t term_enable; // 183
-            uint8_t reserved[8]; // 184-191
         } can;
+        uint8_t reserved_ext[8];          // 184-191
+        struct {
+            uint8_t speed_kp;          // 192  0-100
+            uint8_t speed_ki;          // 193  0-100
+            uint8_t speed_kd;          // 194  0-200
+            uint16_t speed_ff_kdrag;   // 195-196  0-65535
+            uint8_t speed_adapt_lo;    // 197  100-10000 (÷100)
+            uint8_t speed_adapt_hi;    // 198  200-20000 (÷100)
+            uint8_t speed_reserved;    // 199
+        } spd;
     };
-    uint8_t buffer[192];
+    uint8_t buffer[200];
 } EEprom_t;
 
 extern EEprom_t eepromBuffer;
