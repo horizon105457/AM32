@@ -21,9 +21,10 @@ extern uint16_t signaltimeout;
 extern uint16_t input;
 extern volatile uint16_t newinput;
 extern char play_tone_flag;
-extern uint8_t rpm_command_active;
-extern int32_t rpm_target_value;
-extern uint8_t rpm_target_pending;
+extern volatile int32_t newrpm;       // IRQ writes raw RPM
+extern volatile uint8_t rpmSet;        // IRQ sets flag
+extern int32_t rpm;                    // main-loop stable copy
+extern uint8_t rpm_active;
 extern uint32_t MAXIMUM_RPM_SPEED_CONTROL;
 extern uint32_t MINIMUM_RPM_SPEED_CONTROL;
 

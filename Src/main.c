@@ -277,10 +277,10 @@ void setRPM(void);
 //=============================  Defaults =============================
 //===========================================================================
 
-uint8_t rpm_command_active = 0;       // set by DroneCAN RPMCommand handler
-int32_t rpm_target_value = 0;        // RPM target, set by DroneCAN handler, consumed by setRPM()
-uint8_t rpm_target_pending = 0;       // setRPM() flag, cleared by main loop after applying
-uint8_t rpm_pending_retry = 0;        // retry count for rpm direction change (max RPM_PENDING_RETRY_MAX)
+volatile int32_t newrpm = 0;        // IRQ writes (parallels newinput)
+volatile uint8_t rpmSet = 0;         // IRQ sets flag (parallels inputSet)
+int32_t rpm = 0;                     // main-loop stable copy (parallels input)
+uint8_t rpm_active = 0;             // RPM mode active
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 10000;
 uint32_t MINIMUM_RPM_SPEED_CONTROL = 1000;
 
@@ -965,39 +965,43 @@ void startMotor()
 }
 
 /*
-  Set RPM command target (called from DroneCAN IRQ context).
-
-  Mirrors set_input() / newinput pattern:
-  - Only writes flags and variables, does NOT perform any control operations.
-  - All writes are atomic (uint8_t / int32_t) on Cortex-M4.
-  - Direction switching, PID target anchoring, and input/duty assignment
-    are deferred to the main-loop 1kHz block (rpm_target_pending).
+ * Consume RPM command in 1kHz main-loop (triggered by rpmSet flag,
+ * parallels setInput()/newinput pattern).
+ *
+ * Direction mismatch → coast (motor decelerates naturally).
+ * Next FC command with matching direction resumes control.
  */
 void setRPM(void)
 {
-    if (rpm_target_value == 0) {
-        /* 停车 — 全部在 IRQ 中完成 */
-        rpm_command_active = 0;
+    if (rpm == 0) {
+        /* 停车 — 硬停车 */
+        rpm_active = 0;
         SC_Reset(&sc);
         duty_cycle_setpoint = 0;
-        rpm_target_pending = 0;
     } else {
         int8_t desired_dir;
         uint32_t rpm_abs;
-        if (rpm_target_value > 0) {
+        if (rpm > 0) {
             desired_dir = 1 - eepromBuffer.dir_reversed;
-            rpm_abs = (uint32_t)rpm_target_value;
+            rpm_abs = (uint32_t)rpm;
         } else {
             desired_dir = eepromBuffer.dir_reversed;
-            rpm_abs = (uint32_t)(-rpm_target_value);
+            rpm_abs = (uint32_t)(-rpm);
         }
 
         if (rpm_abs < MINIMUM_RPM_SPEED_CONTROL) {
             /* 低于最低转速当作停车 */
-            rpm_command_active = 0;
+            rpm_active = 0;
             SC_Reset(&sc);
             duty_cycle_setpoint = 0;
-            rpm_target_pending = 0;
+        } else if (desired_dir != forward) {
+            /*
+             * 方向冲突 → 停车 coast，保持 running 让电机自然降速。
+             * 不试图主动换向。下次 FC 传来方向匹配的 RPM 时自动恢复控制。
+             */
+            rpm_active = 0;
+            SC_Reset(&sc);
+            duty_cycle_setpoint = 0;
         } else {
             if (rpm_abs > MAXIMUM_RPM_SPEED_CONTROL) {
                 rpm_abs = MAXIMUM_RPM_SPEED_CONTROL;
@@ -1006,10 +1010,7 @@ void setRPM(void)
             if (pp_half < 1) pp_half = 1;
             uint16_t target = 60000000U / rpm_abs / pp_half;
             SC_SetTarget(&sc, target);
-
-            rpm_command_active = 1;
-            /* 方向一致时无需 1kHz 处理 */
-            rpm_target_pending = (desired_dir != forward);
+            rpm_active = 1;
         }
     }
 }
@@ -1061,8 +1062,8 @@ static void rpm_update_throttle(void)
 /* -- RPM preempt: RAW input steals control from RPM ------------------- */
 static inline void rpm_preempt(void)
 {
-    if (rpm_command_active) {
-        rpm_command_active = 0;
+    if (rpm_active) {
+        rpm_active = 0;
         SC_Reset(&sc);
     }
 }
@@ -1518,47 +1519,18 @@ void tenKhzRoutine()
          * setRPM() 已完成 SC_SetTarget 和停车。
          * 此处仅处理 maskPhaseInterrupts 等 1kHz 安全操作。
          */
-#define RPM_PENDING_RETRY_MAX  100  /* ~100 ms @ 1kHz before force-switch */
-        if (rpm_target_pending) {
-            int8_t desired_dir;
-            if (rpm_target_value > 0) {
-                desired_dir = 1 - eepromBuffer.dir_reversed;
-            } else {
-                desired_dir = eepromBuffer.dir_reversed;
-            }
-
-            if (desired_dir != forward) {
-                if ((commutation_interval > reverse_speed_threshold && duty_cycle < 200)
-                    || stepper_sine || (++rpm_pending_retry >= RPM_PENDING_RETRY_MAX))
-                {
-                    if (rpm_pending_retry >= RPM_PENDING_RETRY_MAX) {
-                        /*
-                         * Safety timeout: force direction switch even if
-                         * conditions aren't met.  Prevents deadlock when
-                         * motor can't decelerate fast enough.
-                         */
-                        duty_cycle_setpoint = 0;
-                        last_duty_cycle = 0;
-                        delayMicros(1000);  /* let current decay */
-                    }
-                    forward = desired_dir;
-                    zero_crosses = 0;
-                    old_routine = 1;
-                    maskPhaseInterrupts();
-                    SC_Reset(&sc);  /* PID 重置，observer 重启 */
-                    rpm_pending_retry = 0;
-                    rpm_target_pending = 0;
-                } else {
-                    rpm_target_pending = 1;  /* 下次重试 */
-                }
-            } else {
-                rpm_target_pending = 0;
-                rpm_pending_retry = 0;
-            }
-        } else {
-            rpm_pending_retry = 0;
+        /*
+         * Consume RPM command: IRQ only wrote newrpm + rpmSet.
+         * Snapshot, clear flag, process in main-loop context.
+         * Direction conflict is handled inside setRPM() — motor coasts,
+         * next matching-direction command resumes control.
+         */
+        if (rpmSet) {
+            rpmSet = 0;
+            rpm = newrpm;
+            setRPM();
         }
-/*
+            /*
              * Unified SC_Update entry: handles both FIXED_SPEED_MODE
              * (compile-time) and DroneCAN RPM command (runtime).
              * Single call site prevents logic drift between the two paths.
@@ -1568,7 +1540,7 @@ void tenKhzRoutine()
 #ifdef FIXED_SPEED_MODE
                 running
 #else
-                rpm_command_active
+                rpm_active
 #endif
             ) {
                 SC_Update(&sc, e_com_time, (int)commutation_interval, running, zero_crosses);

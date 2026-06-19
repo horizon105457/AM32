@@ -105,9 +105,7 @@ void SC_Init(SpeedController *sc)
 void SC_SetTarget(SpeedController *sc, uint16_t ecom)
 {
     sc->target_e_com_time = ecom;
-    sc->ff_baseline    = compute_ff(sc, ecom);
-    sc->ff_compensated = sc->ff_baseline;
-    sc->input_override = sc->ff_baseline;
+    sc->ff_compensated = compute_ff(sc, ecom);
     sc->obs_init = 0;
 }
 

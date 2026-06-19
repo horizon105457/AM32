@@ -56,7 +56,6 @@ typedef struct {
     uint16_t coeff_vbat;        /* Vbat when k1/k2 were last computed */
     uint16_t coeff_k_drag;      /* k_drag when k2 was last computed   */
     uint16_t coeff_kv;          /* motor_kv when k1 was last computed */
-    int32_t ff_baseline;
     int32_t ff_compensated;
     int32_t input_override;
     int32_t observed_e_com_time;

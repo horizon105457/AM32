@@ -646,7 +646,8 @@ static void handle_GetNodeInfo(CanardInstance *ins, CanardRxTransfer *transfer)
 
 extern void transfercomplete();
 extern void setInput();
-extern void setRPM(void);
+extern volatile int32_t newrpm;
+extern volatile uint8_t rpmSet;
 
 
 /*
@@ -766,15 +767,16 @@ static void handle_RPMCommand(CanardInstance *ins, CanardRxTransfer *transfer)
         input_mode = INPUT_MODE_RPM;
     }
 
-    // CAN bookkeeping.  setRPM() is safe from IRQ context — it only
-    // writes atomic flags (uint8_t), and rpm_target_value (int32_t).
+    // CAN bookkeeping.  Only write volatile handoff vars here;
+    // setRPM() deferred to 1kHz main loop via rpmSet flag,
+    // matching newinput/inputSet pattern exactly.
     const uint64_t ts = micros64();
     canstats.last_rpm_command_us = ts;
     canstats.num_commands++;
     canstats.total_commands++;
 
-    rpm_target_value = rpm_target;
-    setRPM();
+    newrpm = rpm_target;
+    rpmSet = 1;
 }
 
 /*
@@ -1380,6 +1382,8 @@ void DroneCAN_update()
         if (ts - canstats.last_rpm_command_us > 250000ULL) {
             // RPM timed out → exit RPM mode, stop motor
             input_mode = INPUT_MODE_NONE;
+            rpm_active = 0;
+            SC_Reset(&sc);
             set_input(0);
         }
     }

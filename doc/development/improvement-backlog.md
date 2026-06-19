@@ -29,71 +29,73 @@
 
 ### A-P0 阻塞级
 
-#### A-P0.1 `setInput()` 函数过长（~344 行）
+#### A-P0.1 `setInput()` 函数过长（~344 行） ✅ 已修复
 
 | 项目 | 值 |
 |------|-----|
 | **文件** | `Src/main.c:1052-1396` |
-| **引入时机** | 本地 RPM 模式分支新增了 `rpm_command_active` 抢占逻辑、`prop_brake_active` 交互，函数进一步膨胀 |
-| **问题** | 344 行单一函数承载：输入仲裁、方向切换（单向/双向/RC Car）、正弦/梯形过渡、比例刹车、限流/限温/失步保护。违反 SRP。 |
-| **具体表现** | `setInput()` 内部有 `#ifndef BRUSHED_MODE` 包裹的 ~200 行块；`if (dshot)` / `if (!dshot)` 几乎重复的方向判定；`if (eepromBuffer.rc_car_reverse)` 和 `else` 分支逻辑镜像对称 |
-| **建议** | 拆分为 4-5 个单一职责函数：`processDirection()`, `processSineTransition()`, `processBrakeLogic()`, `applyThrottleLimits()`, `processRpmOverride()` |
-| **收益** | 可读性 ++，测试可行，减少引入新 bug 的概率 |
+| **问题** | ~344 行单一函数承载输入仲裁、方向切换、正弦/梯形过渡、比例刹车、限流/限温/失步保护 |
+| **修复** | 拆分为 4 个 `static inline` 无参函数 (`rpm_preempt`, `process_direction`, `process_stuck_rotor`, `process_motor_throttle`)，`setInput()` 降为 10 行顺序调用 |
 
-#### A-P0.2 RPM 油门路径与普通模式油门逻辑重复
+### A-P0.2 RPM/普通模式油门限幅重复 ✅ 已修复
 
 | 项目 | 值 |
 |------|-----|
-| **文件** | `Src/main.c:1021-1050` (`rpm_update_throttle`) vs `Src/main.c:1052-1396` (`setInput` 下半段) |
-| **引入时机** | 本地新增 `rpm_update_throttle()` |
-| **问题** | `rpm_update_throttle()` 中 `map(raw, 47, 2047, minimum_duty_cycle, 2000)` + 限流 + 失步保护 + 限温逻辑，与 `setInput()` 中普通模式下半段几乎相同（`map(input, 47, 2047, ...)` + `use_current_limit` + `stall_protection_adjust`） |
-| **建议** | 提取公共油门限幅函数 `uint16_t apply_throttle_limits(uint16_t raw_dc, uint16_t min_dc)`，两处统一调用 |
-| **收益** | 消除重复逻辑，避免一处修另一处忘的风险 |
+| **文件** | `Src/main.c` |
+| **问题** | `rpm_update_throttle()` 与 `setInput()` 下半段重复限幅逻辑 |
+| **修复** | 提取 `clamp_duty_cycle()` 共享函数，两处统一调用 |
+
+### A-P0.3 RPM 全局变量治理 ✅ 已修复
+
+| 文件 | 改动 |
+|------|------|
+| `Inc/common.h` | `rpm_target_value` → `newrpm` (volatile)；新增 `rpmSet` (volatile)，`rpm` (稳定副本) |
+| `Src/main.c` | 新增 volatile 手递手变量；`setRPM()` 延迟到 1kHz 主循环消费 `rpmSet` flag |
+| `Src/DroneCAN/DroneCAN.c` | IRQ 仅写 `newrpm + rpmSet`，不再调 `setRPM()` |
+
+完全对标 `newinput`/`inputSet`/`input` 模式。
+
+### A-P0.4 `ff_baseline` 冗余字段移除 ✅ 已修复
+
+去掉 `SpeedController` 结构体中的 `ff_baseline`，`SC_SetTarget` 仅写 `ff_compensated`，
+不再防卫性写 `input_override`。
 
 ---
 
 ### A-P1 高优先级
 
-#### A-P1.1 `FIXED_SPEED_MODE` 与 DroneCAN RPM 模式代码路径重复
+#### A-P1.1 FIXED_SPEED_MODE 与 DroneCAN RPM 路径统一 ✅ 已修复
 
-| 项目 | 值 |
-|------|-----|
-| **文件** | `Src/main.c:1509-1516` 和 `Src/main.c:1522-1526` |
-| **问题** | 两条路径都在 1kHz 块中调用 `SC_Update()` + 将输出映射到 `duty_cycle_setpoint`，但入口条件不同（`#ifdef FIXED_SPEED_MODE` vs `if (rpm_command_active)`），导致维护时需要同时更新两处 |
-| **建议** | 统一入口：`if (rpm_command_active || defined(FIXED_SPEED_MODE)) { SC_Update(); apply_rpm_output(); }` |
-| **收益** | 消除编译条件分支的分歧，未来只需维护一个 RPM 控制链路 |
+| 问题 | 两条独立 `SC_Update` 调用路径 |
+|------|------|
+| **修复** | 统一为 `#if defined(FIXED_SPEED_MODE) || !defined(BRUSHED_MODE)` 单个入口 |
 
 #### A-P1.2 DroneCAN 输入仲裁复杂度高
 
 | 项目 | 值 |
 |------|-----|
-| **文件** | `Src/DroneCAN/DroneCAN.c` (`handle_RPMCommand`, `handle_RawCommand`, `DroneCAN_update`) |
-| **问题** | Raw/RPM 互斥锁 + 250ms 超时 + 1s pending 切换判定，状态机状态数 5+，分支覆盖未通过自动化验证 |
-| **具体场景** | 超时清除 `input_mode` 但保留 `armed` → 另一通道恢复后判定期内可能发出未定义行为；`pending_mode` 与 `input_mode` 的竞争条件 |
-| **建议** | 1) 为仲裁状态机添加显式的 `enum canArbState` 枚举；2) 每个仲裁转换点添加断言（`assert(armed == 1)` 等）；3) 考虑单通道模式（FC 端决定哪个激活）简化仲裁 |
-| **收益** | 降低竞态风险，提高协议鲁棒性 |
+| **文件** | `Src/DroneCAN/DroneCAN.c` |
+| **问题** | Raw/RPM 互斥锁 + 250ms 超时 + 1s pending 切换判定，状态机状态数 5+ |
+| **建议** | 考虑单通道模式简化仲裁 |
 
-#### A-P1.3 `SC_Update()` 系数刷新频率可优化
+#### A-P1.3 SC 系数刷新系数优化 ✅ 已修复
 
-| 项目 | 值 |
-|------|-----|
-| **文件** | `Src/speed_controller.c:124-130` |
-| **问题** | Vbat/k_drag/motor_kv 比较每次 `SC_Update` 调用都执行（1kHz），但三者中除 Vbat 外基本不变 |
-| **建议** | 将系数刷新改为事件驱动：Vbat 仅在 ADC 更新时标记 dirty；k_drag/kv 仅在 ParamSet 时标记 |
-| **收益** | 减少 1kHz 循环中的条件分支开销约每个 cycle 3 次 16-bit 比较 + 2 次 64-bit 乘除 |
+| 文件 | `Src/speed_controller.c` |
+|------|------|
+| **修复** | 添加 `coeff_dirty` flag + `SC_MarkCoeffDirty()` 接口；Vbat 仍每周期检查（动态变化），k_drag/kv 改为事件驱动 |
 
-#### A-P1.4 `rpm_target_pending` 缺超时上限
+#### A-P1.4 方向冲突设计重构 ✅ 已修复（改为 coast 模式）
 
 | 项目 | 值 |
 |------|-----|
-| **文件** | `Src/main.c` (`tenKhzRoutine` 中的 RPM 换向处理) |
-| **问题** | 方向切换条件 `(commutation_interval > reverse_speed_threshold && duty_cycle < 200)` 可能长期不满足（如电机带载减速慢），导致 `rpm_target_pending` 永久重试 |
-| **建议** | 添加重试次数计数器，超过 N 次（如 100 次 = 100ms）后强制切换或停车 |
-| **收益** | 防止方向切换死锁 |
+| **旧设计** | `rpm_pending` + `rpm_retry` 超时强制换向 |
+| **新设计** | 方向冲突 → `SC_Reset` + `duty_cycle=0`，保持 `running` 让电机自然 coast。下次 FC 传来方向匹配的 RPM 命令时自动恢复控制。无持久状态，无重试超时。 |
 
 ---
 
 ### A-P2 中优先级
+
+#### A-P2.1 `common.h` 全局变量耦合加剧
 
 #### A-P2.1 `common.h` 全局变量耦合加剧
 
@@ -363,33 +365,35 @@ void register_param_callback(const char *name, param_change_cb_t cb);
 
 ## 优先级速查
 
-| 编号 | 等级 | 标题 | 归属 | 改造成本 | 收益 |
-|------|------|------|------|---------|------|
-| A-P0.1 | 🔴 Block | `setInput()` ~344 行函数拆分 | **本地** | 中 | 可维护性 ++ |
-| A-P0.2 | 🔴 Block | RPM/普通模式油门限幅重复 | **本地** | 低 | 消除重复逻辑 |
-| A-P1.1 | 🟠 High | FIXED_SPEED_MODE 与 RPM 路径重复 | **本地** | 低 | 统一控制链路 |
-| A-P1.2 | 🟠 High | DroneCAN 仲裁复杂度 | **本地** | 中 | 协议鲁棒性 + |
-| A-P1.3 | 🟠 High | SC 系数刷新频率可优化 | **本地** | 低 | 减少 1kHz 开销 |
-| A-P1.4 | 🟠 High | rpm_target_pending 缺超时 | **本地** | 低 | 防死锁 |
-| A-P2.1 | 🟡 Med | common.h 全局变量耦合 | **本地** | 中 | 可测试性 + |
-| A-P2.2 | 🟡 Med | motor_kv 外部依赖 | **本地** | 低 | 模块化 + |
-| A-P2.3 | 🟡 Med | SC_Init/EEPROM 默认值耦合 | **本地** | 低 | 减少配置分歧 |
-| A-P2.4 | 🟡 Med | 两份 RPM 文档重叠 | **本地** | 低 | 信息集中 |
-| A-P3.1 | ⚪ Low | Shift 溢出保护 | **本地** | 低 | 防 UB |
-| A-P3.2 | ⚪ Low | EEPROM_VERSION 注释 | **本地** | 低 | 版本管理 |
-| B-P0.1 | 🔴 Critical | Flash 无超时保护 | **官方** | 低 | 防永久挂死 |
-| B-P0.2 | 🔴 Critical | map() 递归栈溢出 | **官方** | 低 | 消除硬故障 |
-| B-P0.3 | 🔴 Critical | delayMillis 中断嵌套 | **官方** | 中 | 时序可预测 |
-| B-P1.1 | 🟠 Major | EEPROM 磨损均衡 | **官方** | 高 | 延长硬件寿命 |
-| B-P1.2 | 🟠 Major | NXP delayMicros 无超时 | **官方** | 低 | 防 NXP 挂死 |
-| B-P1.3 | 🟠 Major | disable_irq 临界区粗 | **官方** | 中 | 降低 DShot 抖动 |
-| B-P1.4 | 🟠 Major | 魔法数字泛滥 | **官方** | 中 | 可维护性 + |
-| B-P1.5 | 🟠 Major | 中断优先级 MCU 覆盖不全 | **官方** | 低 | 实时性一致 |
-| B-P2.1 | ⚪ Minor | eeprom.c 代码重复 | **官方** | 高 | 消除 ~700 行重复 |
-| B-P2.2 | ⚪ Minor | 注释死代码 | **官方** | 低 | 可读性 |
-| B-P2.3 | ⚪ Minor | -flto 未启用 | **官方** | 低 | 代码尺寸 -5~15% |
-| B-P2.4 | ⚪ Minor | DroneCAN 测试覆盖盲区 | **官方** | 低 | 质量保证 |
-| B-P2.5 | ⚪ Minor | format.sh 未集成 CI | **官方** | 低 | 代码风格一致 |
+| 编号 | 等级 | 标题 | 归属 | 状态 | 收益 |
+|------|------|------|------|------|------|
+| A-P0.1 | 🔴 Block | `setInput()` ~344 行函数拆分 | **本地** | ✅ 已修复 | 可维护性 ++ |
+| A-P0.2 | 🔴 Block | 油门限幅重复 (`clamp_duty_cycle`) | **本地** | ✅ 已修复 | 消除重复逻辑 |
+| A-P0.3 | 🟡 Med | RPM 全局变量治理 (newrpm/rpmSet/rpm) | **本地** | ✅ 已修复 | 竞态消除 + 命名一致 |
+| A-P0.4 | ⚪ Low | ff_baseline 冗余字段 | **本地** | ✅ 已修复 | 减少结构体膨胀 |
+| A-P1.1 | 🟠 High | FIXED_SPEED/RPM 路径统一 | **本地** | ✅ 已修复 | 统一控制链路 |
+| A-P1.3 | 🟠 High | SC 系数刷新 dirty flag | **本地** | ✅ 已修复 | 减少 1kHz 开销 |
+| A-P1.4 | 🟠 High | 方向冲突 coast 重构 | **本地** | ✅ 已修复 | 消除 pending 状态机 |
+| A-P3.1 | ⚪ Low | Shift 溢出 _Static_assert | **本地** | ✅ 已修复 | 防 UB |
+| A-P3.2 | ⚪ Low | EEPROM_VERSION 注释 | **本地** | ✅ 已修复 | 版本管理 |
+| A-P1.2 | 🟠 High | DroneCAN 仲裁复杂度 | **本地** | ⏳ 待处理 | 协议鲁棒性 + |
+| A-P2.1 | 🟡 Med | common.h 全局变量耦合 | **本地** | ⏳ 待处理 | 可测试性 + |
+| A-P2.2 | 🟡 Med | motor_kv 外部依赖 | **本地** | ⏳ 待处理 | 模块化 + |
+| A-P2.3 | 🟡 Med | SC_Init/EEPROM 默认值耦合 | **本地** | ⏳ 待处理 | 减少配置分歧 |
+| A-P2.4 | 🟡 Med | 两份 RPM 文档重叠 | **本地** | ⏳ 待处理 | 信息集中 |
+| B-P0.1 | 🔴 Critical | Flash 无超时保护 | **官方** | ⏳ 待处理 | 防永久挂死 |
+| B-P0.2 | 🔴 Critical | map() 递归栈溢出 | **官方** | ⏳ 待处理 | 消除硬故障 |
+| B-P0.3 | 🔴 Critical | delayMillis 中断嵌套 | **官方** | ⏳ 待处理 | 时序可预测 |
+| B-P1.1 | 🟠 Major | EEPROM 磨损均衡 | **官方** | ⏳ 待处理 | 延长硬件寿命 |
+| B-P1.2 | 🟠 Major | NXP delayMicros 无超时 | **官方** | ⏳ 待处理 | 防 NXP 挂死 |
+| B-P1.3 | 🟠 Major | disable_irq 临界区粗 | **官方** | ⏳ 待处理 | 降低 DShot 抖动 |
+| B-P1.4 | 🟠 Major | 魔法数字泛滥 | **官方** | ⏳ 待处理 | 可维护性 + |
+| B-P1.5 | 🟠 Major | 中断优先级 MCU 覆盖不全 | **官方** | ⏳ 待处理 | 实时性一致 |
+| B-P2.1 | ⚪ Minor | eeprom.c 代码重复 | **官方** | ⏳ 待处理 | 消除 ~700 行重复 |
+| B-P2.2 | ⚪ Minor | 注释死代码 | **官方** | ⏳ 待处理 | 可读性 |
+| B-P2.3 | ⚪ Minor | -flto 未启用 | **官方** | ⏳ 待处理 | 代码尺寸 -5~15% |
+| B-P2.4 | ⚪ Minor | DroneCAN 测试覆盖盲区 | **官方** | ⏳ 待处理 | 质量保证 |
+| B-P2.5 | ⚪ Minor | format.sh 未集成 CI | **官方** | ⏳ 待处理 | 代码风格一致 |
 
 ---
 
