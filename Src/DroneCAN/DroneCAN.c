@@ -395,6 +395,7 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
                 *ptr16 = val;
                 if (ptr16 == &motor_kv) {
                     eepromBuffer.motor_kv = (uint8_t)((*(uint16_t *)p->ptr - 20) / 40);
+                    SC_MarkCoeffDirty(&sc);
                 } else if (ptr16 == &low_cell_volt_cutoff) {
                     eepromBuffer.low_cell_volt_cutoff = (uint8_t)(*ptr16 - 250);
                 } else if (ptr16 == &sc.pid.Kp) {
@@ -405,6 +406,7 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
                     eepromBuffer.spd.speed_kd = (uint8_t)val;
                 } else if (ptr16 == &sc.k_drag) {
                     eepromBuffer.spd.speed_ff_kdrag = val;
+                    SC_MarkCoeffDirty(&sc);
                 } else if (ptr16 == &sc.adapt_low_ecom) {
                     eepromBuffer.spd.speed_adapt_lo = (uint8_t)(val / 100);
                 } else if (ptr16 == &sc.adapt_high_ecom) {

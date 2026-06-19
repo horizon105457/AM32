@@ -123,6 +123,7 @@ void SC_RestoreFromEeprom(SpeedController *sc)
     sc->k_drag          = eepromBuffer.spd.speed_ff_kdrag;
     sc->adapt_low_ecom  = (uint16_t)eepromBuffer.spd.speed_adapt_lo * 100;
     sc->adapt_high_ecom = (uint16_t)eepromBuffer.spd.speed_adapt_hi * 100;
+    sc->coeff_dirty = 1;  /* force refresh on next SC_Update */
     update_coeffs(sc);  /* k_drag may have changed → refresh k2 */
 }
 
@@ -167,8 +168,12 @@ uint16_t SC_Update(SpeedController *sc, int ecom, int ci, uint8_t run, uint32_t 
         p->derivative = (kd * df / 100);
     }
 
-    /* Coefficient refresh on Vbat, k_drag, or motor_kv change */
-    if (battery_voltage != sc->coeff_vbat || sc->k_drag != sc->coeff_k_drag || motor_kv != sc->coeff_kv) {
+    /* Coefficient refresh: Vbat changes dynamically; k_drag/kv use dirty flag */
+    if (battery_voltage != sc->coeff_vbat) {
+        update_coeffs(sc);
+        sc->ff_compensated = compute_ff(sc, sc->target_e_com_time);
+    } else if (sc->coeff_dirty) {
+        sc->coeff_dirty = 0;
         update_coeffs(sc);
         sc->ff_compensated = compute_ff(sc, sc->target_e_com_time);
     }
@@ -210,6 +215,11 @@ void SC_Reset(SpeedController *sc) {
     sc->pid.filtered_value = sc->pid.last_filtered = sc->pid.pid_output = 0;
     sc->input_override = 0; sc->obs_init = 0; sc->trend = 0;
     sc->step_count = 0; sc->last_step_interval = 0;
+    sc->coeff_dirty = 0;
+}
+
+void SC_MarkCoeffDirty(SpeedController *sc) {
+    sc->coeff_dirty = 1;
 }
 
 uint16_t SC_GetTarget(const SpeedController *sc)   { return sc->target_e_com_time; }

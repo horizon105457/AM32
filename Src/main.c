@@ -280,6 +280,7 @@ void setRPM(void);
 uint8_t rpm_command_active = 0;       // set by DroneCAN RPMCommand handler
 int32_t rpm_target_value = 0;        // RPM target, set by DroneCAN handler, consumed by setRPM()
 uint8_t rpm_target_pending = 0;       // setRPM() flag, cleared by main loop after applying
+uint8_t rpm_pending_retry = 0;        // retry count for rpm direction change (max RPM_PENDING_RETRY_MAX)
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 10000;
 uint32_t MINIMUM_RPM_SPEED_CONTROL = 1000;
 
@@ -1014,9 +1015,29 @@ void setRPM(void)
 }
 
 /*
-  内部函数：读取 SC PID 输出并写入油门链。
-  每次 SC_Update 后调用 (1kHz 周期)。
-  电机启动自包含，启动逻辑与 setInput() 下半段同源。
+ * Clamp duty_cycle against all protection limits.
+ * Shared by setInput() (normal mode) and rpm_update_throttle() (RPM mode).
+ * Returns clamped value; does NOT write duty_cycle_setpoint directly
+ * so callers can interleave their own logic.
+ */
+static inline uint16_t clamp_duty_cycle(uint16_t dc, uint16_t input_val)
+{
+    if (input_val >= 47 && (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection))) {
+        if (dc < min_startup_duty)       dc = min_startup_duty;
+        if (dc > startup_max_duty_cycle) dc = startup_max_duty_cycle;
+    }
+    if (dc > duty_cycle_maximum)      dc = duty_cycle_maximum;
+    if (use_current_limit && dc > use_current_limit_adjust)
+        dc = use_current_limit_adjust;
+    if (stall_protection_adjust > 0 && input_val > 47)
+        dc += (uint16_t)(stall_protection_adjust / 10000);
+    return dc;
+}
+
+/*
+ * Read SC PID output and write into throttle chain.
+ * Called after each SC_Update (1kHz period).
+ * Motor-start logic mirrors the setInput() lower half.
  */
 static void rpm_update_throttle(void)
 {
@@ -1029,21 +1050,9 @@ static void rpm_update_throttle(void)
             running = 1;
             last_duty_cycle = min_startup_duty;
         }
-        duty_cycle_setpoint = map(raw, 47, 2047, minimum_duty_cycle, 2000);
+        duty_cycle_setpoint = clamp_duty_cycle(
+            map(raw, 47, 2047, minimum_duty_cycle, 2000), raw);
         prop_brake_active = 0;
-        if (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
-            if (duty_cycle_setpoint < min_startup_duty)
-                duty_cycle_setpoint = min_startup_duty;
-            if (duty_cycle_setpoint > startup_max_duty_cycle)
-                duty_cycle_setpoint = startup_max_duty_cycle;
-        }
-        if (duty_cycle_setpoint > duty_cycle_maximum)
-            duty_cycle_setpoint = duty_cycle_maximum;
-        if (use_current_limit &&
-            duty_cycle_setpoint > use_current_limit_adjust)
-            duty_cycle_setpoint = use_current_limit_adjust;
-        if (stall_protection_adjust > 0)
-            duty_cycle_setpoint += (uint16_t)(stall_protection_adjust / 10000);
     } else {
         duty_cycle_setpoint = 0;
     }
@@ -1366,28 +1375,7 @@ if (!stepper_sine && armed) {
             }
         }
         if (!prop_brake_active) {
-            if (input >= 47 && (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection))) {
-                if (duty_cycle_setpoint < min_startup_duty) {
-                    duty_cycle_setpoint = min_startup_duty;
-                }
-                if (duty_cycle_setpoint > startup_max_duty_cycle) {
-                    duty_cycle_setpoint = startup_max_duty_cycle;
-                }
-            }
-
-            if (duty_cycle_setpoint > duty_cycle_maximum) {
-                duty_cycle_setpoint = duty_cycle_maximum;
-            }
-            if (use_current_limit) {
-                if (duty_cycle_setpoint > use_current_limit_adjust) {
-                    duty_cycle_setpoint = use_current_limit_adjust;
-                }
-            }
-
-            if (stall_protection_adjust > 0 && input > 47) {
-
-                duty_cycle_setpoint = duty_cycle_setpoint + (uint16_t)(stall_protection_adjust/10000);
-            }
+            duty_cycle_setpoint = clamp_duty_cycle(duty_cycle_setpoint, input);
         }
     }
 #endif
@@ -1509,9 +1497,8 @@ void tenKhzRoutine()
          * setRPM() 已完成 SC_SetTarget 和停车。
          * 此处仅处理 maskPhaseInterrupts 等 1kHz 安全操作。
          */
+#define RPM_PENDING_RETRY_MAX  100  /* ~100 ms @ 1kHz before force-switch */
         if (rpm_target_pending) {
-            rpm_target_pending = 0;
-
             int8_t desired_dir;
             if (rpm_target_value > 0) {
                 desired_dir = 1 - eepromBuffer.dir_reversed;
@@ -1521,27 +1508,54 @@ void tenKhzRoutine()
 
             if (desired_dir != forward) {
                 if ((commutation_interval > reverse_speed_threshold && duty_cycle < 200)
-                    || stepper_sine)
+                    || stepper_sine || (++rpm_pending_retry >= RPM_PENDING_RETRY_MAX))
                 {
+                    if (rpm_pending_retry >= RPM_PENDING_RETRY_MAX) {
+                        /*
+                         * Safety timeout: force direction switch even if
+                         * conditions aren't met.  Prevents deadlock when
+                         * motor can't decelerate fast enough.
+                         */
+                        duty_cycle_setpoint = 0;
+                        last_duty_cycle = 0;
+                        delayMicros(1000);  /* let current decay */
+                    }
                     forward = desired_dir;
                     zero_crosses = 0;
                     old_routine = 1;
                     maskPhaseInterrupts();
                     SC_Reset(&sc);  /* PID 重置，observer 重启 */
+                    rpm_pending_retry = 0;
+                    rpm_target_pending = 0;
                 } else {
                     rpm_target_pending = 1;  /* 下次重试 */
                 }
+            } else {
+                rpm_target_pending = 0;
+                rpm_pending_retry = 0;
             }
+        } else {
+            rpm_pending_retry = 0;
         }
+/*
+             * Unified SC_Update entry: handles both FIXED_SPEED_MODE
+             * (compile-time) and DroneCAN RPM command (runtime).
+             * Single call site prevents logic drift between the two paths.
+             */
+#if defined(FIXED_SPEED_MODE) || !defined(BRUSHED_MODE)
+            if (
 #ifdef FIXED_SPEED_MODE
-            if (running) {
+                running
+#else
+                rpm_command_active
+#endif
+            ) {
                 SC_Update(&sc, e_com_time, (int)commutation_interval, running, zero_crosses);
+#ifdef FIXED_SPEED_MODE
                 duty_cycle_setpoint = map(SC_GetOutput(&sc), 47, 2047, minimum_duty_cycle, 2000);
-            }
-#elif !defined(BRUSHED_MODE)
-            if (rpm_command_active) {
-                SC_Update(&sc, e_com_time, (int)commutation_interval, running, zero_crosses);
-                rpm_update_throttle();           /* 内部油门写入 */
+#else
+                rpm_update_throttle();
+#endif
             }
 #endif
         }

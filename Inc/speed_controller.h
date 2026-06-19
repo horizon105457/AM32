@@ -34,6 +34,10 @@ extern "C" {
 #define SC_K1_SHIFT                 10
 #define SC_K2_SHIFT                 28
 
+/* safety: shift < 32 avoids undefined behaviour on int32 */
+_Static_assert(SC_K1_SHIFT < 32 && SC_K2_SHIFT < 32,
+    "SC_K1_SHIFT and SC_K2_SHIFT must be < 32");
+
 typedef struct {
     uint16_t Kp, Ki, Kd;
     int32_t error, integral, integral_limit;
@@ -60,6 +64,7 @@ typedef struct {
     uint8_t obs_init;
     uint8_t step_count;
     int32_t last_step_interval;
+    uint8_t coeff_dirty;        /* non-zero → refresh k1/k2 on next SC_Update */
 } SpeedController;
 
 void SC_Init(SpeedController *sc);
@@ -68,6 +73,7 @@ void SC_RestoreFromEeprom(SpeedController *sc);
 uint16_t SC_Update(SpeedController *sc, int ecom, int ci, uint8_t run, uint32_t zc);
 uint16_t SC_GetOutput(const SpeedController *sc);
 void     SC_Reset(SpeedController *sc);
+void     SC_MarkCoeffDirty(SpeedController *sc);
 uint16_t SC_GetTarget(const SpeedController *sc);
 int32_t  SC_GetObserved(const SpeedController *sc);
 
