@@ -569,6 +569,13 @@ volatile uint16_t waitTime = 0;
 uint16_t signaltimeout = 0;
 uint8_t ubAnalogWatchdogStatus = RESET;
 
+/* RPM closed-loop control */
+SpeedController sc;
+volatile int32_t newrpm;
+volatile uint8_t rpmSet;
+int32_t rpm;
+uint8_t rpm_active;
+
 #if defined(NEED_INPUT_READY) || defined(NXP)
 volatile char input_ready = 0;
 #endif
@@ -1332,6 +1339,81 @@ if (!stepper_sine && armed) {
 #endif
 }
 
+/* RPM closed-loop: setRPM() - process RPM target */
+void setRPM(void)
+{
+    if (rpm == 0) {
+        rpm_active = 0;
+        SC_Reset(&sc);
+        input = 0;
+        duty_cycle_setpoint = 0;
+    } else {
+        int8_t desired_dir;
+        uint32_t rpm_abs;
+        if (rpm > 0) {
+            desired_dir = 1 - eepromBuffer.dir_reversed;
+            rpm_abs = (uint32_t)rpm;
+        } else {
+            desired_dir = eepromBuffer.dir_reversed;
+            rpm_abs = (uint32_t)(-rpm);
+        }
+
+        if (rpm_abs <= MINIMUM_RPM_SPEED_CONTROL) {
+            rpm_active = 0;
+            SC_Reset(&sc);
+            duty_cycle_setpoint = 0;
+        } else if (desired_dir != forward) {
+            /* Direction conflict: coast (keep rpm_active for commutation timing) */
+            rpm_active = 1;
+            SC_Reset(&sc);
+            duty_cycle_setpoint = 0;
+        } else {
+            if (rpm_abs > MAXIMUM_RPM_SPEED_CONTROL)
+                rpm_abs = MAXIMUM_RPM_SPEED_CONTROL;
+            uint16_t target = 60000000U / rpm_abs / (eepromBuffer.motor_poles / 2);
+            SC_SetTarget(&sc, target);
+            rpm_active = 1;
+        }
+    }
+}
+
+/* RPM closed-loop: rpm_update_throttle() - update duty from SC output */
+static void rpm_update_throttle(void)
+{
+    uint16_t raw = SC_GetOutput(&sc);
+    input = raw;
+    if (raw >= 47) {
+        if (!running) {
+            allOff();
+            startMotor();
+            running = 1;
+            last_duty_cycle = min_startup_duty;
+        }
+        if (eepromBuffer.use_sine_start) {
+            duty_cycle_setpoint = map(raw, 137, 2047, minimum_duty_cycle + 40, 2000);
+        } else {
+            duty_cycle_setpoint = map(raw, 47, 2047, minimum_duty_cycle, 2000);
+        }
+        prop_brake_active = 0;
+    } else {
+        duty_cycle_setpoint = 0;
+    }
+
+    /* Apply clamp_duty_cycle */
+    if (raw >= 47 && zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection)) {
+        if (duty_cycle_setpoint < min_startup_duty)
+            duty_cycle_setpoint = min_startup_duty;
+        if (duty_cycle_setpoint > startup_max_duty_cycle)
+            duty_cycle_setpoint = startup_max_duty_cycle;
+    }
+    if (duty_cycle_setpoint > duty_cycle_maximum)
+        duty_cycle_setpoint = duty_cycle_maximum;
+    if (use_current_limit && duty_cycle_setpoint > use_current_limit_adjust)
+        duty_cycle_setpoint = use_current_limit_adjust;
+    if (stall_protection_adjust > 0 && raw > 47)
+        duty_cycle_setpoint += (uint16_t)(stall_protection_adjust / 10000);
+}
+
 void tenKhzRoutine()
 { // 20khz as of 2.00 to be renamed
     duty_cycle = duty_cycle_setpoint;
@@ -1421,6 +1503,21 @@ void tenKhzRoutine()
         if (one_khz_loop_counter > PID_LOOP_DIVIDER) { // 1khz PID loop
             PROCESS_ADC_FLAG = 1; // set flag to do new adc read at lower priority
             one_khz_loop_counter = 0;
+
+            /* RPM closed-loop: consume rpmSet */
+            if (rpmSet) {
+                rpm = newrpm;
+                rpmSet = 0;
+                setRPM();
+            }
+
+            /* RPM closed-loop: run SC_Update */
+            if (rpm_active) {
+                SC_Update(&sc, e_com_time, commutation_interval,
+                          running, zero_crosses, battery_voltage);
+                rpm_update_throttle();
+            }
+
             if (use_current_limit && running) {
                 use_current_limit_adjust -= (int16_t)(doPidCalculations(&currentPid, actual_current,
                                                           eepromBuffer.limits.current * 2 * 100)
@@ -1769,7 +1866,13 @@ int main(void)
         eepromBuffer.eeprom_version = EEPROM_VERSION;
         saveEEpromSettings();
     }
-    
+
+    /* RPM closed-loop: init SpeedController */
+    SC_Init(&sc);
+    if (eepromBuffer.eeprom_version >= 4) {
+        SC_RestoreFromEeprom(&sc);
+    }
+
     if (eepromBuffer.dir_reversed == 1) {
         forward = 0;
     } else {

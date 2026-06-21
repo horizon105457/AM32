@@ -69,6 +69,16 @@ typedef union EEprom_u {
             uint8_t debug_rate; // 182
             uint8_t term_enable; // 183
             uint8_t reserved[8]; // 184-191
+            /* v4: Speed PID parameters */
+            struct {
+                uint8_t  speed_kp;        // 192
+                uint8_t  speed_ki;        // 193
+                uint8_t  speed_kd;        // 194
+                uint16_t speed_ff_kdrag;  // 195-196
+                uint8_t  speed_adapt_lo;  // 197
+                uint8_t  speed_adapt_hi;  // 198
+                uint8_t  spd_pad;         // 199 (alignment)
+            } spd;
         } can;
     };
     uint8_t buffer[192];

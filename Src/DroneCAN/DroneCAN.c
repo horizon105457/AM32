@@ -174,6 +174,13 @@ static const struct parameter {
         { "CAN_TERM_ENABLE",        T_BOOL,  0, 1,   0, &eepromBuffer.can.term_enable},
 #endif
         { "STARTUP_TUNE",           T_STRING,0, 4,   0, &eepromBuffer.tune},
+        /* Speed PID parameters */
+        { "SPEED_KP",               T_UINT16,0, 100, 8, &sc.pid.Kp},
+        { "SPEED_KI",               T_UINT16,0, 100, 3, &sc.pid.Ki},
+        { "SPEED_KD",               T_UINT16,0, 200, 60, &sc.pid.Kd},
+        { "SPEED_FF_KDRAG",         T_UINT16,0, 65535, 4640, &sc.k_drag},
+        { "SPEED_ADAPT_LO",         T_UINT16,100, 10000, 2500, &sc.adapt_low_ecom},
+        { "SPEED_ADAPT_HI",         T_UINT16,200, 20000, 6000, &sc.adapt_high_ecom},
 };
 
 /*
@@ -675,6 +682,36 @@ static void handle_RawCommand(CanardInstance *ins, CanardRxTransfer *transfer)
 }
 
 /*
+  handle a ESC RPMCommand request
+*/
+static void handle_RPMCommand(CanardInstance *ins, CanardRxTransfer *transfer)
+{
+    struct uavcan_equipment_esc_RPMCommand cmd;
+    if (uavcan_equipment_esc_RPMCommand_decode(transfer, &cmd)) {
+        return;
+    }
+    // see if it is for us
+    if (cmd.rpm.len <= eepromBuffer.can.esc_index) {
+        return;
+    }
+
+    const int32_t rpm_target = cmd.rpm.data[(unsigned)eepromBuffer.can.esc_index];
+
+    const uint64_t ts = micros64();
+    canstats.num_commands++;
+    canstats.total_commands++;
+
+    /* arm-on-restart */
+    if (!armed && eepromBuffer.can.require_arming && dronecan_armed) {
+        armed = 1;
+    }
+
+    signaltimeout = 0;
+    newrpm = rpm_target;
+    rpmSet = 1;
+}
+
+/*
   handle ArmingStatus messages
 */
 static void handle_ArmingStatus(CanardInstance *ins, CanardRxTransfer *transfer)
@@ -685,8 +722,15 @@ static void handle_ArmingStatus(CanardInstance *ins, CanardRxTransfer *transfer)
     }
 
     dronecan_armed = (cmd.status == UAVCAN_EQUIPMENT_SAFETY_ARMINGSTATUS_STATUS_FULLY_ARMED);
-    if (!dronecan_armed && eepromBuffer.can.require_arming && canstats.last_raw_command_us != 0) {
-        set_input(0);
+    if (!dronecan_armed && eepromBuffer.can.require_arming) {
+        if (canstats.last_raw_command_us != 0 || rpmSet || rpm_active) {
+            /* RPM mode: cleanup SC */
+            if (rpm_active) {
+                rpm_active = 0;
+                SC_Reset(&sc);
+            }
+            set_input(0);
+        }
     }
 }
 
@@ -902,6 +946,10 @@ static void onTransferReceived(CanardInstance *ins, CanardRxTransfer *transfer)
             handle_RawCommand(ins, transfer);
             break;
         }
+        case UAVCAN_EQUIPMENT_ESC_RPMCOMMAND_ID: {
+            handle_RPMCommand(ins, transfer);
+            break;
+        }
         case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID: {
             handle_DNA_Allocation(ins, transfer);
             break;
@@ -961,6 +1009,10 @@ static bool shouldAcceptTransfer(const CanardInstance *ins,
         switch (data_type_id) {
         case UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID: {
             *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
+            return true;
+        }
+        case UAVCAN_EQUIPMENT_ESC_RPMCOMMAND_ID: {
+            *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RPMCOMMAND_SIGNATURE;
             return true;
         }
         case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID: {
@@ -1252,6 +1304,23 @@ void DroneCAN_update()
         // ensure at least 1kHz signal is seen by main code
         set_input(last_can_input);
         canstats.last_raw_command_us = ts;
+    }
+
+    /* RPM closed-loop: check timeout */
+    if (rpm_active && !rpmSet) {
+        /* No RPM update for 250ms -> stop */
+        static uint64_t last_rpm_update_us = 0;
+        if (last_rpm_update_us != 0 && ts - last_rpm_update_us > 250000ULL) {
+            rpm_active = 0;
+            SC_Reset(&sc);
+            set_input(0);
+            last_rpm_update_us = 0;
+        }
+    }
+    if (rpmSet) {
+        /* Update timestamp on new RPM command */
+        static uint64_t last_rpm_update_us = 0;
+        last_rpm_update_us = ts;
     }
 
     sys_can_enable_IRQ();

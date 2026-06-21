@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "eeprom.h"
+#include "speed_controller.h"
 
 #pragma once
 
@@ -89,3 +90,12 @@ enum inputType {
     EDTARM_IN = 4,
     DRONECAN_IN = 5,
 };
+
+/* RPM closed-loop control */
+extern SpeedController sc;
+extern volatile int32_t newrpm;
+extern volatile uint8_t rpmSet;
+extern int32_t rpm;
+extern uint8_t rpm_active;
+extern uint32_t MAXIMUM_RPM_SPEED_CONTROL;
+extern uint32_t MINIMUM_RPM_SPEED_CONTROL;
