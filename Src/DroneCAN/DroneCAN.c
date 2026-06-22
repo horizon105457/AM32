@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <version.h>
 #include <eeprom.h>
+#include <speed_controller.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -392,6 +393,8 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
             default:
                 return;
 	}
+
+        SC_MarkCoeffDirty(&sc);
 
         if (last_dir_reversed != eepromBuffer.dir_reversed ||
             last_bi_direction != eepromBuffer.bi_direction) {

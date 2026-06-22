@@ -275,18 +275,8 @@ void zcfoundroutine(void);
 //=============================  Defaults =============================
 //===========================================================================
 
-uint8_t drive_by_rpm = 0;
 uint32_t MAXIMUM_RPM_SPEED_CONTROL = 10000;
 uint32_t MINIMUM_RPM_SPEED_CONTROL = 1000;
-
-// assign speed control PID values values are x10000
-fastPID speedPid = { // commutation speed loop time
-    .Kp = 10,
-    .Ki = 0,
-    .Kd = 100,
-    .integral_limit = 10000,
-    .output_limit = 50000
-};
 
 fastPID currentPid = { // 1khz loop time
     .Kp = 400,
@@ -352,10 +342,6 @@ uint16_t ADC_CCR = 30;
 uint16_t current_angle = 90;
 uint16_t desired_angle = 90;
 char return_to_center = 0;
-uint16_t target_e_com_time = 0;
-int16_t Speed_pid_output;
-char use_speed_control_loop = 0;
-int32_t input_override = 0;
 int16_t use_current_limit_adjust = 2000;
 char use_current_limit = 0;
 int32_t stall_protection_adjust = 0;
@@ -405,8 +391,8 @@ uint16_t low_pin_count = 0;
 uint8_t max_duty_cycle_change = 2;
 char fast_accel = 1;
 char fast_deccel = 0;
-uint16_t last_duty_cycle = 0;
-uint16_t duty_cycle_setpoint = 0;
+int16_t last_duty_cycle = 0;
+int16_t duty_cycle_setpoint = 0;
 char play_tone_flag = 0;
 
 typedef enum { GPIO_PIN_RESET = 0U,
@@ -562,7 +548,7 @@ uint8_t min_bemf_counts_down = TARGET_MIN_BEMF_COUNTS;
 volatile uint16_t lastzctime;
 volatile uint16_t thiszctime;
 
-volatile uint16_t duty_cycle = 0;
+volatile int16_t duty_cycle = 0;
 char step = 1;
 volatile uint32_t commutation_interval = 12500;
 volatile uint16_t waitTime = 0;
@@ -1155,56 +1141,26 @@ void setInput()
                     2047, 160, 2047);
             }
         } else {
-            if (use_speed_control_loop) {
-                if (drive_by_rpm) {
-                    target_e_com_time = 60000000 / map(adjusted_input, 47, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL) / (eepromBuffer.motor_poles / 2);
-                    if (adjusted_input < 47) { // dead band ?
-                        input = 0;
-                        speedPid.error = 0;
-                        input_override = 0;
-                    } else {
-                        input = (uint16_t)(input_override / 10000); // speed control pid override
-                        if (input > 2047) {
-                            input = 2047;
-                        }
-                        if (input < 48) {
-                            input = 48;
-                        }
-                    }
-                } else {
 
-                    input = (uint16_t)(input_override / 10000); // speed control pid override
-                    if (input > 2047) {
-                        input = 2047;
-                    }
-                    if (input < 48) {
-                        input = 48;
-                    }
-                }
-            } else {
-
-                input = adjusted_input;
-            }
+            input = adjusted_input;
         }
 #endif
     }
 #endif
 #ifndef BRUSHED_MODE
-if (!stepper_sine && armed) {
+    if (!stepper_sine && armed) {
         if (input >= 47 + (80 * eepromBuffer.use_sine_start)) {
-            if (running == 0) {
-                allOff();
-                if (!old_routine) {
-                    startMotor();
-                }
-                running = 1;
-                last_duty_cycle = min_startup_duty;
+            int16_t duty;
+            if (eepromBuffer.use_sine_start) {
+                duty = map(input, 137, 2047, minimum_duty_cycle + 40, 2000);
+            } else {
+                duty = map(input, 47, 2047, minimum_duty_cycle, 2000);
             }
 
-            if (eepromBuffer.use_sine_start) {
-                duty_cycle_setpoint = map(input, 137, 2047, minimum_duty_cycle+40, 2000);
+            if (!motor_is_running()) {
+                motor_start(duty);
             } else {
-                duty_cycle_setpoint = map(input, 47, 2047, minimum_duty_cycle, 2000);
+                motor_set_duty(duty);
             }
 
             if (!eepromBuffer.rc_car_reverse) {
@@ -1215,7 +1171,7 @@ if (!stepper_sine && armed) {
         if (input < 47 + (80 * eepromBuffer.use_sine_start)) {
             if (play_tone_flag != 0) {
                 switch (play_tone_flag) {
-									
+
                 case 1:
                     playDefaultTone();
                     break;
@@ -1236,36 +1192,39 @@ if (!stepper_sine && armed) {
             }
 
             if (!eepromBuffer.comp_pwm) {
-                duty_cycle_setpoint = 0;
-                if (!running) {
+                motor_set_duty(0);
+                if (!motor_is_running()) {
                     old_routine = 1;
                     zero_crosses = 0;
                     if (eepromBuffer.brake_on_stop) {
-                        fullBrake();
+                        motor_full_brake();
                     } else {
                         if (!prop_brake_active) {
-                            allOff();
+                            motor_coast();
                         }
                     }
                 }
                 if (eepromBuffer.rc_car_reverse && prop_brake_active) {
 #ifndef PWM_ENABLE_BRIDGE
 
-                  if (dshot == 0) prop_brake_duty_cycle = (getAbsDif(1000, newinput) + 1000);
-                    if (dshot)  {
-                        if (newinput <= 1047 && newinput > 47) prop_brake_duty_cycle = ((newinput - 48) * 2 + 47) - reversing_dead_band;
-                        if (newinput > 1047) prop_brake_duty_cycle = ((newinput - 1048) * 2 + 47) - reversing_dead_band;
+                    if (dshot == 0)
+                        prop_brake_duty_cycle = (getAbsDif(1000, newinput) + 1000);
+                    if (dshot) {
+                        if (newinput <= 1047 && newinput > 47)
+                            prop_brake_duty_cycle = ((newinput - 48) * 2 + 47) - reversing_dead_band;
+                        if (newinput > 1047)
+                            prop_brake_duty_cycle = ((newinput - 1048) * 2 + 47) - reversing_dead_band;
                     }
                     if (prop_brake_duty_cycle >= (1999)) {
 
-                        fullBrake();
+                        motor_full_brake();
                     } else {
-                        proportionalBrake();
+                        motor_prop_brake(-(int16_t)prop_brake_duty_cycle);
                     }
 #endif
                 }
             } else {
-                if (!running) {
+                if (!motor_is_running()) {
 
                     old_routine = 1;
                     zero_crosses = 0;
@@ -1273,23 +1232,23 @@ if (!stepper_sine && armed) {
                     if (eepromBuffer.brake_on_stop > 0) {
                         if (!eepromBuffer.use_sine_start) {
 #ifndef PWM_ENABLE_BRIDGE
-                          if(eepromBuffer.brake_on_stop == 1){
-                             prop_brake_duty_cycle =  eepromBuffer.drag_brake_strength * 200;
-                              if (prop_brake_duty_cycle >= (1999)) {
-                                fullBrake();
-                              } else {
-                                proportionalBrake();
-                                prop_brake_active = 1;
-                              }
-                           }
+                            if (eepromBuffer.brake_on_stop == 1) {
+                                prop_brake_duty_cycle = eepromBuffer.drag_brake_strength * 200;
+                                if (prop_brake_duty_cycle >= (1999)) {
+                                    motor_full_brake();
+                                } else {
+                                    motor_prop_brake(-(int16_t)prop_brake_duty_cycle);
+                                    prop_brake_active = 1;
+                                }
+                            }
 #else
                             // todo add proportional braking for pwm/enable style bridge.
 #endif
                         }
                     } else {
-                        allOff();
+                        motor_coast();
                     }
-                    duty_cycle_setpoint = 0;
+                    motor_set_duty(0);
                 }
 
                 phase_A_position = ((step - 1) * 60) + enter_sine_angle;
@@ -1308,32 +1267,21 @@ if (!stepper_sine && armed) {
                 if (eepromBuffer.use_sine_start == 1) {
                     stepper_sine = 1;
                 }
-                duty_cycle_setpoint = 0;
+                motor_set_duty(0);
             }
         }
-        if (!prop_brake_active) {
-            if (input >= 47 && (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection))) {
-                if (duty_cycle_setpoint < min_startup_duty) {
-                    duty_cycle_setpoint = min_startup_duty;
-                }
-                if (duty_cycle_setpoint > startup_max_duty_cycle) {
-                    duty_cycle_setpoint = startup_max_duty_cycle;
-                }
+        if (prop_brake_active) {
+#ifndef PWM_ENABLE_BRIDGE
+            if (dshot == 0)
+                prop_brake_duty_cycle = (getAbsDif(1000, newinput) + 1000);
+            if (dshot) {
+                if (newinput <= 1047 && newinput > 47)
+                    prop_brake_duty_cycle = ((newinput - 48) * 2 + 47) - reversing_dead_band;
+                if (newinput > 1047)
+                    prop_brake_duty_cycle = ((newinput - 1048) * 2 + 47) - reversing_dead_band;
             }
-
-            if (duty_cycle_setpoint > duty_cycle_maximum) {
-                duty_cycle_setpoint = duty_cycle_maximum;
-            }
-            if (use_current_limit) {
-                if (duty_cycle_setpoint > use_current_limit_adjust) {
-                    duty_cycle_setpoint = use_current_limit_adjust;
-                }
-            }
-
-            if (stall_protection_adjust > 0 && input > 47) {
-
-                duty_cycle_setpoint = duty_cycle_setpoint + (uint16_t)(stall_protection_adjust/10000);
-            }
+#endif
+            motor_set_duty(-(int16_t)prop_brake_duty_cycle);
         }
     }
 #endif
@@ -1540,70 +1488,78 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running) {
-                input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
-                if (input_override > 2047 * 10000) {
-                    input_override = 2047 * 10000;
-                }
-                if (input_override < 0) {
-                    input_override = 0;
-                }
-                if (zero_crosses < 100) {
-                    speedPid.integral = 0;
-                }
-            }
         }
-        if (ramp_count > ramp_divider) {
-          ramp_count = 0;
+        // --- Ramp: only for positive duty (drive) ---
+        if (duty_cycle > 0) {
+            if (ramp_count > ramp_divider) {
+                ramp_count = 0;
 #ifdef VOLTAGE_BASED_RAMP
-            uint16_t voltage_based_max_change = map(battery_voltage, 800, 2200, 10, 1);
-            if (average_interval > 200) {
-                max_duty_cycle_change = voltage_based_max_change;
-            } else {
-                max_duty_cycle_change = voltage_based_max_change * 3;
-            }
-#else
-            if (zero_crosses < 150 || last_duty_cycle < 150) {   
-                max_duty_cycle_change = max_ramp_startup;
-            } else {
-                if (average_interval > 500) {
-                    max_duty_cycle_change = max_ramp_low_rpm;
+                uint16_t voltage_based_max_change = map(battery_voltage, 800, 2200, 10, 1);
+                if (average_interval > 200) {
+                    max_duty_cycle_change = voltage_based_max_change;
                 } else {
-                    max_duty_cycle_change = max_ramp_high_rpm;
+                    max_duty_cycle_change = voltage_based_max_change * 3;
                 }
-            }
-          
+#else
+                if (zero_crosses < 150 || last_duty_cycle < 150) {
+                    max_duty_cycle_change = max_ramp_startup;
+                } else {
+                    if (average_interval > 500) {
+                        max_duty_cycle_change = max_ramp_low_rpm;
+                    } else {
+                        max_duty_cycle_change = max_ramp_high_rpm;
+                    }
+                }
 #endif
 #ifdef CUSTOM_RAMP
-   //         max_duty_cycle_change = eepromBuffer[30];
+                //         max_duty_cycle_change = eepromBuffer[30];
 #endif
-            if ((duty_cycle - last_duty_cycle) > max_duty_cycle_change) {
-                duty_cycle = last_duty_cycle + max_duty_cycle_change;
-
-            }
-            if ((last_duty_cycle - duty_cycle) > max_duty_cycle_change) {
-                duty_cycle = last_duty_cycle - max_duty_cycle_change;
-            }
-            }else{
-             duty_cycle = last_duty_cycle;
-            }
-
-        if ((armed && running) && input > 47) {
-            if (eepromBuffer.variable_pwm) {
-            }
-            adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000) + 1;
-
-        } else {
-
-            if (prop_brake_active) {
-              adjusted_duty_cycle =  tim1_arr - ((prop_brake_duty_cycle * tim1_arr) / 2000);
+                if ((duty_cycle - last_duty_cycle) > max_duty_cycle_change) {
+                    duty_cycle = last_duty_cycle + max_duty_cycle_change;
+                }
+                if ((last_duty_cycle - duty_cycle) > max_duty_cycle_change) {
+                    duty_cycle = last_duty_cycle - max_duty_cycle_change;
+                }
             } else {
-              if((eepromBuffer.brake_on_stop == 2) && armed){  // require arming for active brake
-                comStep(2);
-                adjusted_duty_cycle = DEAD_TIME + ((eepromBuffer.active_brake_power * tim1_arr) / 2000)* 10;
-            }else{
-                adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000);
+                duty_cycle = last_duty_cycle;
             }
+        }
+
+        // --- Clamp: only for positive duty (drive) ---
+        if (duty_cycle > 0) {
+            if (input >= 47 && (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection))) {
+                if (duty_cycle < min_startup_duty) {
+                    duty_cycle = min_startup_duty;
+                }
+                if (duty_cycle > startup_max_duty_cycle) {
+                    duty_cycle = startup_max_duty_cycle;
+                }
+            }
+            if (duty_cycle > duty_cycle_maximum) {
+                duty_cycle = duty_cycle_maximum;
+            }
+            if (use_current_limit && duty_cycle > use_current_limit_adjust) {
+                duty_cycle = use_current_limit_adjust;
+            }
+            if (stall_protection_adjust > 0 && input > 47) {
+                duty_cycle = duty_cycle + (int16_t)(stall_protection_adjust / 10000);
+            }
+        }
+
+        // --- PWM output: duty sign directly determines mode ---
+        if (duty_cycle > 0) {
+            // DRIVE: high-side proportional PWM
+            adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000) + 1;
+        } else if (duty_cycle < 0) {
+            // BRAKE: low-side proportional brake
+            adjusted_duty_cycle = tim1_arr - (((uint16_t)(-duty_cycle) * tim1_arr) / 2000);
+        } else {
+            // COAST
+            if ((eepromBuffer.brake_on_stop == 2) && armed) {
+                motor_active_brake();
+                adjusted_duty_cycle = DEAD_TIME + ((eepromBuffer.active_brake_power * tim1_arr) / 2000) * 10;
+            } else {
+                adjusted_duty_cycle = 0;
             }
         }
         last_duty_cycle = duty_cycle;
@@ -1964,9 +1920,6 @@ int main(void)
 #else
     // checkForHighSignal();     // will reboot if signal line is high for 10ms
     receiveDshotDma();
-    if (drive_by_rpm) {
-        use_speed_control_loop = 1;
-    }
 #endif
 
 #endif // end fixed duty mode ifdef

@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "eeprom.h"
+#include "motor_control.h"
 #include "speed_controller.h"
 
 #pragma once
@@ -99,3 +100,8 @@ extern int32_t rpm;
 extern uint8_t rpm_active;
 extern uint32_t MAXIMUM_RPM_SPEED_CONTROL;
 extern uint32_t MINIMUM_RPM_SPEED_CONTROL;
+
+/* Motor control interface state */
+extern int16_t duty_cycle_setpoint;
+extern int16_t last_duty_cycle;
+extern uint16_t min_startup_duty;

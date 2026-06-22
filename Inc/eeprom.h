@@ -81,7 +81,7 @@ typedef union EEprom_u {
             } spd;
         } can;
     };
-    uint8_t buffer[192];
+    uint8_t buffer[200];
 } EEprom_t;
 
 extern EEprom_t eepromBuffer;
