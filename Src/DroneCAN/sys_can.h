@@ -22,7 +22,7 @@ struct CANStats {
     int32_t rx_ecode;
     uint32_t should_accept;
     uint32_t on_receive;
-    uint64_t last_raw_command_us;
+    uint64_t last_command_us;
 };
 
 extern struct CANStats canstats;

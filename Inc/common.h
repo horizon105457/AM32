@@ -1,9 +1,10 @@
-#include <stdint.h>
+#pragma once
+
 #include "eeprom.h"
 #include "motor_control.h"
 #include "speed_controller.h"
-
-#pragma once
+#include "targets.h"
+#include <stdint.h>
 
 extern EEprom_t eepromBuffer;
 extern uint32_t eeprom_address;
@@ -92,6 +93,30 @@ enum inputType {
     DRONECAN_IN = 5,
 };
 
+/*
+  DroneCAN input interface
+  ISR: decode + validate + assign, no control logic
+  1kHz loop: routing + scaling + arming + direction
+ */
+#ifndef RPM_SHIFT
+#define RPM_SHIFT 0
+#endif
+
+#define DRONECAN_MODE_NONE 0
+#define DRONECAN_MODE_RAW 1
+#define DRONECAN_MODE_RPM 2
+
+struct DroneCANInput {
+    volatile int16_t raw_throttle; // -8192~8191 (RAW mode)
+    volatile int16_t rpm_target; // RPM value (compressed by RPM_SHIFT)
+    volatile uint8_t mode; // DRONECAN_MODE_NONE / RAW / RPM
+    volatile bool ready; // new data pending
+};
+
+extern struct DroneCANInput dronecan_input;
+extern bool dronecan_armed;
+
+#ifndef MCU_GDE23
 /* RPM closed-loop control */
 extern SpeedController sc;
 extern volatile int32_t newrpm;
@@ -100,8 +125,17 @@ extern int32_t rpm;
 extern uint8_t rpm_active;
 extern uint32_t MAXIMUM_RPM_SPEED_CONTROL;
 extern uint32_t MINIMUM_RPM_SPEED_CONTROL;
+#endif
 
 /* Motor control interface state */
 extern int16_t duty_cycle_setpoint;
 extern int16_t last_duty_cycle;
 extern uint16_t min_startup_duty;
+
+/* Bottom-layer hardware state (owned by main.c, accessed by motor_control.c) */
+extern uint16_t tim1_arr;
+extern uint16_t adjusted_duty_cycle;
+extern char step;
+extern char prop_brake_active;
+extern volatile uint32_t commutation_interval;
+extern volatile char armed;

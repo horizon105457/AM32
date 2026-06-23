@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sys_can.h"
 #include <stdbool.h>
 
 #if DRONECAN_SUPPORT

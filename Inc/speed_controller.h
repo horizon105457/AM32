@@ -10,19 +10,23 @@
  */
 
 #pragma once
+
+#include "targets.h"
 #include <stdint.h>
+
+#ifndef MCU_GDE23
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Default parameters */
-#define SC_DEFAULT_KDRAG     4640
+#define SC_DEFAULT_KDRAG 4640
 #define SC_DEFAULT_ADAPT_LOW 2500
 #define SC_DEFAULT_ADAPT_HIGH 6000
-#define SC_DEFAULT_KP        8
-#define SC_DEFAULT_KI        3
-#define SC_DEFAULT_KD        60
+#define SC_DEFAULT_KP 8
+#define SC_DEFAULT_KI 3
+#define SC_DEFAULT_KD 60
 
 /* k1/k2 shift values */
 #define SC_K1_SHIFT 10
@@ -53,15 +57,17 @@ typedef struct {
     uint8_t coeff_dirty;
 } SpeedController;
 
-void SC_Init(SpeedController *sc);
-void SC_SetTarget(SpeedController *sc, uint16_t e_com);
-void SC_RestoreFromEeprom(SpeedController *sc);
-uint16_t SC_Update(SpeedController *sc, int ecom, int ci,
-                   uint8_t run, uint32_t zc, uint16_t vbat);
-uint16_t SC_GetOutput(const SpeedController *sc);
-void SC_Reset(SpeedController *sc);
-void SC_MarkCoeffDirty(SpeedController *sc);
+void SC_Init(SpeedController* sc);
+void SC_SetTarget(SpeedController* sc, uint16_t e_com);
+void SC_RestoreFromEeprom(SpeedController* sc);
+uint16_t SC_Update(SpeedController* sc, int ecom, int ci,
+    uint8_t run, uint32_t zc, uint16_t vbat);
+uint16_t SC_GetOutput(const SpeedController* sc);
+void SC_Reset(SpeedController* sc);
+void SC_MarkCoeffDirty(SpeedController* sc);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* !MCU_GDE23 */
