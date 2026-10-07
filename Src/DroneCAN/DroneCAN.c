@@ -6,6 +6,10 @@
 
 // #pragma GCC optimize("O0")
 
+#ifndef RAW_COMMAND_DEBUG
+#define RAW_COMMAND_DEBUG 0
+#endif
+
 #if DRONECAN_SUPPORT
 
 #include "peripherals.h"
@@ -97,6 +101,11 @@ static struct PACKED {
     uint16_t adc_raw_current;    // current sense ADC counts
     uint16_t adc_raw_volts;      // voltage sense ADC counts
     uint8_t flags;               // bit0 armed, bit1 running, bit2 stepper_sine
+#if RAW_COMMAND_DEBUG
+    // version 3 fields: cumulative counts since boot, wrapping at 2^32
+    uint32_t total_commands;     // decoded RAW transfers containing our ESC index
+    uint32_t total_input;        // set_input calls, including periodic refresh
+#endif
 } debug1;
 
 static void can_printf(const char *fmt, ...);
@@ -1157,7 +1166,7 @@ static void send_FlexDebug(void)
     /*
       popupate debug1
      */
-    debug1.version = 2;
+    debug1.version = RAW_COMMAND_DEBUG ? 3 : 2;
     debug1.commutation_interval = commutation_interval;
     debug1.auto_advance_level = auto_advance_level;
     debug1.num_commands = canstats.total_commands - last.total_commands;
@@ -1171,6 +1180,12 @@ static void send_FlexDebug(void)
     debug1.adc_raw_current = ADC_raw_current;
     debug1.adc_raw_volts = ADC_raw_volts;
     debug1.flags = (armed ? 1 : 0) | (running ? 2 : 0) | (stepper_sine ? 4 : 0);
+#if RAW_COMMAND_DEBUG
+    // DroneCAN_update already excludes CAN RX while taking this snapshot.
+    // Cumulative counts remain usable even if a debug transfer is lost.
+    debug1.total_commands = canstats.total_commands;
+    debug1.total_input = canstats.num_input;
+#endif
 
     last.num_input = canstats.num_input;
     last.total_commands = canstats.total_commands;
@@ -1321,7 +1336,12 @@ void DroneCAN_update()
 	send_ESCStatus();
     }
     if (eepromBuffer.can.debug_rate > 0 && ts >= next_flexdebug_at) {
+#if RAW_COMMAND_DEBUG
+        // Debug samples are disposable; never catch up missed periods in bursts.
+        next_flexdebug_at = ts + 1000000ULL/eepromBuffer.can.debug_rate;
+#else
         next_flexdebug_at += 1000000ULL/eepromBuffer.can.debug_rate;
+#endif
         send_FlexDebug();
     }
 

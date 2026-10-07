@@ -43,11 +43,22 @@ VERSION_MINOR := $(shell $(FGREP) "define VERSION_MINOR" $(MAIN_INC_DIR)/version
 
 FIRMWARE_VERSION := $(VERSION_MAJOR).$(VERSION_MINOR)
 
+# Optional RAW reception accounting; DEBUG_RATE remains the runtime switch.
+RAW_COMMAND_DEBUG ?= 0
+ifneq ($(words $(RAW_COMMAND_DEBUG)),1)
+$(error RAW_COMMAND_DEBUG must be 0 or 1)
+endif
+ifeq ($(filter $(RAW_COMMAND_DEBUG),0 1),)
+$(error RAW_COMMAND_DEBUG must be 0 or 1)
+endif
+
 # Compiler options
 
 CFLAGS_BASE := -fsingle-precision-constant -fomit-frame-pointer -ffast-math
 CFLAGS_BASE += -I$(MAIN_INC_DIR) -g3 -O3 -ffunction-sections --specs=nosys.specs
 CFLAGS_BASE += -Wall -Wundef -Wextra -Werror -Wno-unused-parameter -Wno-stringop-truncation
+
+CFLAGS_BASE += -DRAW_COMMAND_DEBUG=$(RAW_COMMAND_DEBUG)
 
 CFLAGS_COMMON := $(CFLAGS_BASE)
 

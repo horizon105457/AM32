@@ -19,17 +19,24 @@ function log_AM32()
    for i = 0, 3 do
       local last_ts = last_tstamp[i] or ts_zero
       tstamp_us, msg = DroneCAN_get_FlexDebug(0, ESC_BASE+i, AM32_DEBUG, last_ts)
-      if tstamp_us then
+      if tstamp_us and #msg >= 18 then
          local dt = (tstamp_us - last_ts):tofloat()*1.0e-6
          version, commutation_interval, num_commands, num_input, rx_errors, rxframe_error, rx_ecode, auto_advance_level = string.unpack("<BiHHHHiB", msg)
-         if version ~= 1 then
+         if version ~= 1 and version ~= 2 and version ~= 3 then
             if not reported_version_error then
                reported_version_error = true
                gcs:send_text(0, string.format("AM32 debug version error %u", version))
             end
             return
          end
+         if (version == 2 and #msg ~= 29) or (version == 3 and #msg ~= 37) then
+            return
+         end
          logger:write('AMD1','Node,CI,NC,NI,RXerr,FrE,RXec,AAL','BiHHHHiB','#-------','--------',i,commutation_interval, num_commands, num_input, rx_errors, rxframe_error, rx_ecode, auto_advance_level)
+         if version == 3 and #msg >= 37 then
+            local total_commands, total_input = string.unpack("<I4I4", msg, 30)
+            logger:write('AMD3','Node,TC,TI','BII',i,total_commands,total_input)
+         end
          gcs:send_named_float(string.format('AM32_EC_%u',i), rx_ecode)
          -- gcs:send_named_float(string.format('AM32_NI_%u',i), num_input/dt)
          -- gcs:send_named_float(string.format('AM32_CI_%u',i), commutation_interval)
@@ -46,5 +53,3 @@ end
 gcs:send_text(0, "Loaded AM32_debug_log")
 
 return update, 5
-
-
