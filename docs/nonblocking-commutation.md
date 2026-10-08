@@ -73,15 +73,24 @@ unwrapped timeout routes the sampled period to the estimator. The callback is
 a stub: phase changes, final zero_crosses and ISR interleavings are not simulated.
 These models do not measure ISR or physical timing. Independent review covered preload,
 cancellation, flags and preemption; coordinator closeout preserved immediate
-ownership and narrowed E230 scope. The repaired image is not hardware-tested.
+ownership and narrowed E230 scope.
 
-After flashing the debug-enabled repaired Nano, repeat the original
-8/12/20-channel, 20/50/100/200 Hz stationary/CMD163 matrix with identical motor
-parameters, TELEM_RATE=100 and DEBUG_RATE=2. Verify counter continuity, TX echo
-counts, FIFO-overflow deltas and acceptance deficits. Retain raw frames on one
-clock; local TX echo does not establish physical bus timing. Also measure
-ZC-to-commutation delay/masked time and check startup, reversal, coast and
-sine/mode handover. Single-node results are not eight-node cluster acceptance.
+The repaired debug Nano was subsequently tested on 2026-10-08. The same
+24-case matrix (CMD0/163, 8/12/20 channels, 20/50/100/200 Hz, eight seconds per
+case plus one zero command) accepted 17784/17784 commands, with no added driver
+FIFO-overflow observations. The official-base diagnostic image accepted all
+8892 stationary commands, but only 7518/8892 running commands, with 1368
+FIFO-overflow observations. Both captures had zero reported socket overflow or
+missing kernel timestamps. See [reproduction and limitations](raw-command-reception-reproduction.md)
+for configuration, accounting and evidence hashes.
+
+This is one Nano L431 at one positive low-throttle setting, not cluster or
+cross-platform acceptance. Manual flashing identifies the intended candidate;
+GetNodeInfo provides no commit/image CRC to authenticate it remotely. Tail
+period estimates shortened despite identical demand fields, so unchanged motor
+behavior has not been established. Actual ZC-to-commutation delay, masked time,
+ISR worst-case duration, reversal and sine/mode handover still need measurement.
+Local TX echo does not establish physical bus timing.
 
 ## Final build record
 
@@ -107,6 +116,7 @@ Nano OFF: Flash 54269 B, RAM 8232 B, BIN 54813 B, SHA256
 `0d1872d6953b81542793ffb9b3ad413eee49dd89b8488970c2e1fc3c8b95ff71`.
 Nano debug ON: Flash 54309 B, RAM 8240 B, BIN 54853 B, SHA256
 `7ae11a4826e7e21103f4f6cb7c52342e2859187f1d48cb9da6620d25345081ce`.
-The debug-enabled image is under `nano-debug/` in the final output directory;
-use it for the identical command-count comparison after flashing. No hardware
-operation or repair-image hardware validation was performed in this closeout.
+The debug-enabled image is under `nano-debug/` in the final output directory.
+It was used for the subsequent single-Nano command-count comparison above. The
+build-only closeout preceded that hardware test; its exact source hashes match
+repair commit `b657a9d0391d7b18d15b59fc23dddc5090506c73`.
