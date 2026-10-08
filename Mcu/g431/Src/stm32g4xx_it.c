@@ -126,8 +126,10 @@ void TIM6_DAC_IRQHandler(void)
 
 void TIM1_UP_TIM16_IRQHandler(void)
 {
-    PeriodElapsedCallback();
-    LL_TIM_ClearFlag_UPDATE(TIM16);
+    if ((TIM16->SR & TIM_SR_UIF) && (TIM16->DIER & TIM_DIER_UIE)) {
+        LL_TIM_ClearFlag_UPDATE(TIM16);
+        PeriodElapsedCallback();
+    }
 }
 
 void EXTI15_10_IRQHandler(void)

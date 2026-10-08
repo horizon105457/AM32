@@ -220,6 +220,7 @@ an settings option)
 #include "IO.h"
 #include "common.h"
 #include "comparator.h"
+#include "commutation.h"
 #include "dshot.h"
 #include "eeprom.h"
 #include "functions.h"
@@ -251,6 +252,11 @@ an settings option)
 #include "version.h"
 
 void zcfoundroutine(void);
+
+#ifdef ASYNC_POLLING_COMMUTATION
+static void completePollingCommutation(uint32_t epoch);
+static void schedulePollingCommutation(uint32_t epoch);
+#endif
 
 // firmware build options !! fixed speed and duty cycle modes are not to be used
 // with sinusoidal startup !!
@@ -868,6 +874,129 @@ void getBemfState()
     }
 }
 
+#ifdef ASYNC_POLLING_COMMUTATION
+enum { COM_NONE, COM_POLL, COM_COMP };
+static volatile uint8_t commutation_pending;
+static volatile uint32_t commutation_epoch;
+
+static void cancelCommutationLocked(void)
+{
+    stopCommutationTimer();
+    commutation_pending = COM_NONE;
+    zcfound = 0;
+    commutation_epoch++;
+}
+#endif
+
+void cancelCommutation(void)
+{
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    cancelCommutationLocked();
+    __set_PRIMASK(primask);
+#endif
+}
+
+static void setCommutationDirection(char direction, uint8_t keep_mode)
+{
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    cancelCommutationLocked();
+    forward = direction;
+    zcfound = 0;
+    bemfcounter = 0;
+    if (!keep_mode) {
+        maskPhaseInterrupts();
+        zero_crosses = 0;
+        old_routine = 1;
+    } else if (!old_routine && running) {
+        /* RC reversing keeps its current comparator mode. */
+        enableCompInterrupts();
+    }
+    __set_PRIMASK(primask);
+#else
+    forward = direction;
+    if (!keep_mode) {
+        zero_crosses = 0;
+        old_routine = 1;
+        maskPhaseInterrupts();
+    }
+#endif
+}
+
+static void stopCommutation(void)
+{
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    maskPhaseInterrupts();
+    cancelCommutationLocked();
+    running = 0;
+    zcfound = 0;
+    bemfcounter = 0;
+    __set_PRIMASK(primask);
+#else
+    running = 0;
+#endif
+}
+
+#ifdef ASYNC_POLLING_COMMUTATION
+static void commitCommutationPhase(void)
+{
+    if (forward == 1) {
+        step++;
+        if (step > 6) {
+            step = 1;
+            desync_check = 1;
+        }
+        rising = step % 2;
+    } else {
+        step--;
+        if (step < 1) {
+            step = 6;
+            desync_check = 1;
+        }
+        rising = !(step % 2);
+    }
+#ifdef INVERTED_EXTI
+    rising = !rising;
+#endif
+    if (!prop_brake_active) {
+        comStep(step);
+    }
+}
+
+static void finishCommutationPhase(void)
+{
+    changeCompInput();
+#ifndef NO_POLLING_START
+	if (average_interval > polling_mode_changeover + 500) {
+      old_routine = 1;
+   }
+#endif
+    bemfcounter = 0;
+    zcfound = 0;
+    commutation_intervals[step - 1] = commutation_interval; // just used to calulate average
+
+#ifdef USE_PULSE_OUT
+	if(step == 1 || step == 4  ){
+    WRITE_REG(RPM_PULSE_PORT->ODR, READ_REG(RPM_PULSE_PORT->ODR) ^ RPM_PULSE_PIN);
+	}
+#endif
+}
+
+void commutate()
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    commitCommutationPhase();
+    finishCommutationPhase();
+    __set_PRIMASK(primask);
+}
+
+#else
 void commutate()
 {
     if (forward == 1) {
@@ -909,6 +1038,7 @@ void commutate()
 	}
 #endif
 }
+#endif
 
 /*
  * @brief 	Called by the COM_TIMER interrupt handler after the set wait time
@@ -918,6 +1048,48 @@ void commutate()
  */
 void PeriodElapsedCallback()
 {
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint8_t pending = commutation_pending;
+    if (pending == COM_NONE) {
+        __set_PRIMASK(primask);
+        return;
+    }
+    stopCommutationTimer();
+    commutation_pending = COM_NONE;
+    uint32_t epoch = commutation_epoch;
+    commitCommutationPhase();
+    finishCommutationPhase();
+    __set_PRIMASK(primask);
+    if (pending == COM_POLL) {
+        completePollingCommutation(epoch);
+        return;
+    }
+    uint32_t interval = (commutation_interval + ((lastzctime + thiszctime) >> 1)) >> 1;
+    uint32_t new_advance;
+    uint16_t delay;
+    if (!calculateCommutationTiming(interval,
+            eepromBuffer.auto_advance ? auto_advance_level : temp_advance,
+            &new_advance, &delay)) {
+        /* Keep the previous estimate; the ordinary timeout recovery resumes
+         * polling. No wrapped or unrepresentable delay is scheduled. */
+        return;
+    }
+    __disable_irq();
+    if (epoch == commutation_epoch) {
+        commutation_interval = interval;
+        advance = new_advance;
+        waitTime = delay;
+        if (!old_routine) {
+            enableCompInterrupts();
+        }
+        if (zero_crosses < 10000) {
+            zero_crosses++;
+        }
+    }
+    __set_PRIMASK(primask);
+#else
     DISABLE_COM_TIMER_INT(); // disable interrupt
     commutate();
     commutation_interval = ((commutation_interval)+((lastzctime + thiszctime) >> 1))>>1;
@@ -933,6 +1105,7 @@ void PeriodElapsedCallback()
     if (zero_crosses < 10000) {
         zero_crosses++;
     }
+#endif
 }
 
 /*
@@ -942,6 +1115,12 @@ void PeriodElapsedCallback()
  */
 void interruptRoutine()
 {
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t epoch = commutation_epoch;
+    if (old_routine || !running || stepper_sine || commutation_pending != COM_NONE) {
+        return;
+    }
+#endif
 //   if (average_interval > 125) {
 //        if ((INTERVAL_TIMER_COUNT < 125) && (duty_cycle < 600) && (zero_crosses < 500)) { // should be impossible, desync?exit anyway
 //           return;
@@ -963,13 +1142,41 @@ void interruptRoutine()
                 return;
             }
         }
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t primask = __get_PRIMASK();
+#endif
     __disable_irq();
+#ifdef ASYNC_POLLING_COMMUTATION
+    if (epoch != commutation_epoch || old_routine || !running || stepper_sine || commutation_pending != COM_NONE) {
+        __set_PRIMASK(primask);
+        return;
+    }
+#endif
     maskPhaseInterrupts();
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t captured_period = INTERVAL_TIMER_COUNT;
+    uint8_t overflow = commutationIntervalOverflowed();
+    if (!commutationCaptureValid(captured_period, overflow) || waitTime > UINT16_MAX - 1) {
+        /* Retain CNT/UIF for the main-loop timeout recovery. */
+        stopCommutationTimer();
+        zcfound = 1;
+        __set_PRIMASK(primask);
+        return;
+    }
     lastzctime = thiszctime;
-    thiszctime = INTERVAL_TIMER_COUNT;  
+    thiszctime = (uint16_t)captured_period;
+    resetCommutationInterval(0);
+    loadCommutationTimer(waitTime + 1);
+    commutation_pending = COM_COMP;
+    startCommutationTimer(0);
+    __set_PRIMASK(primask);
+#else
+    lastzctime = thiszctime;
+    thiszctime = INTERVAL_TIMER_COUNT;
     SET_INTERVAL_TIMER_COUNT(0);
     SET_AND_ENABLE_COM_INT(waitTime+1); // enable COM_TIMER interrupt
     __enable_irq();
+#endif
 }
 
 void startMotor()
@@ -977,7 +1184,11 @@ void startMotor()
     if (running == 0) {
         commutate();
         commutation_interval = 10000;
+#ifdef ASYNC_POLLING_COMMUTATION
+        resetCommutationInterval(5000);
+#else
         SET_INTERVAL_TIMER_COUNT(5000);
+#endif
         running = 1;
     }
     enableCompInterrupts();
@@ -994,7 +1205,7 @@ void setInput()
                         //               if (running) {
                         prop_brake_active = 1;
                         if (return_to_center) {
-                            forward = 1 - eepromBuffer.dir_reversed;
+                            setCommutationDirection(1 - eepromBuffer.dir_reversed, 1);
                             prop_brake_active = 0;
                             return_to_center = 0;
                         }
@@ -1009,7 +1220,7 @@ void setInput()
                         adjusted_input = 0;
                         prop_brake_active = 1;
                         if (return_to_center) {
-                            forward = eepromBuffer.dir_reversed;
+                            setCommutationDirection(eepromBuffer.dir_reversed, 1);
                             prop_brake_active = 0;
                             return_to_center = 0;
                         }
@@ -1030,10 +1241,7 @@ void setInput()
                 if (newinput > (1000 + (servo_dead_band << 1))) {
                     if (forward == eepromBuffer.dir_reversed) {
                         if (((commutation_interval > reverse_speed_threshold) && (duty_cycle < 200)) || stepper_sine) {
-                            forward = 1 - eepromBuffer.dir_reversed;
-                            zero_crosses = 0;
-                            old_routine = 1;
-                            maskPhaseInterrupts();
+                            setCommutationDirection(1 - eepromBuffer.dir_reversed, 0);
                             brushed_direction_set = 0;
                         } else {
                             newinput = 1000;
@@ -1044,10 +1252,7 @@ void setInput()
                 if (newinput < (1000 - (servo_dead_band << 1))) {
                     if (forward == (1 - eepromBuffer.dir_reversed)) {
                         if (((commutation_interval > reverse_speed_threshold) && (duty_cycle < 200)) || stepper_sine) {
-                            zero_crosses = 0;
-                            old_routine = 1;
-                            forward = eepromBuffer.dir_reversed;
-                            maskPhaseInterrupts();
+                            setCommutationDirection(eepromBuffer.dir_reversed, 0);
                             brushed_direction_set = 0;
                         } else {
                             newinput = 1000;
@@ -1069,7 +1274,7 @@ void setInput()
                          adjusted_input = 0;
                          prop_brake_active = 1;
                          if (return_to_center) {
-                             forward = 1 - eepromBuffer.dir_reversed;
+                             setCommutationDirection(1 - eepromBuffer.dir_reversed, 1);
                              prop_brake_active = 0;
                              return_to_center = 0;
                          }
@@ -1084,7 +1289,7 @@ void setInput()
                          adjusted_input = 0;
                          prop_brake_active = 1;
                          if (return_to_center) {
-                             forward = eepromBuffer.dir_reversed;
+                             setCommutationDirection(eepromBuffer.dir_reversed, 1);
                              prop_brake_active = 0;
                              return_to_center = 0;
                          }
@@ -1106,10 +1311,7 @@ void setInput()
 
                 if (forward == eepromBuffer.dir_reversed) {
                     if (((commutation_interval > reverse_speed_threshold) && (duty_cycle < 200)) || stepper_sine) {
-                        forward = 1 - eepromBuffer.dir_reversed;
-                        zero_crosses = 0;
-                        old_routine = 1;
-                        maskPhaseInterrupts();
+                        setCommutationDirection(1 - eepromBuffer.dir_reversed, 0);
                         brushed_direction_set = 0;
                      } else {
                         newinput = 0;
@@ -1120,10 +1322,7 @@ void setInput()
             if (newinput <= 1047 && newinput > 47) {
                 if (forward == (1 - eepromBuffer.dir_reversed)) {
                     if (((commutation_interval > reverse_speed_threshold) && (duty_cycle < 200)) || stepper_sine) {
-                        zero_crosses = 0;
-                        old_routine = 1;
-                        forward = eepromBuffer.dir_reversed;
-                        maskPhaseInterrupts();
+                        setCommutationDirection(eepromBuffer.dir_reversed, 0);
                         brushed_direction_set = 0;
                      } else {
                         newinput = 0;
@@ -1142,6 +1341,7 @@ void setInput()
     }
 #ifndef BRUSHED_MODE
     if ((bemf_timeout_happened > bemf_timeout) && eepromBuffer.stuck_rotor_protection) {
+        stopCommutation();
         allOff();
         maskPhaseInterrupts();
         input = 0;
@@ -1208,6 +1408,17 @@ if (!stepper_sine && armed) {
                 if (!old_routine) {
                     startMotor();
                 }
+#ifdef ASYNC_POLLING_COMMUTATION
+                else {
+                    uint32_t primask = __get_PRIMASK();
+                    __disable_irq();
+                    maskPhaseInterrupts();
+                    cancelCommutationLocked();
+                    resetCommutationInterval(0);
+                    running = 1;
+                    __set_PRIMASK(primask);
+                }
+#endif
                 running = 1;
                 last_duty_cycle = min_startup_duty;
             }
@@ -1303,7 +1514,21 @@ if (!stepper_sine && armed) {
                     duty_cycle_setpoint = 0;
                 }
 
-                phase_A_position = ((step - 1) * 60) + enter_sine_angle;
+                char sine_step = step;
+                if (eepromBuffer.use_sine_start == 1) {
+#ifdef ASYNC_POLLING_COMMUTATION
+                    uint32_t primask = __get_PRIMASK();
+                    __disable_irq();
+                    maskPhaseInterrupts();
+                    cancelCommutationLocked();
+                    sine_step = step;
+                    stepper_sine = 1;
+                    __set_PRIMASK(primask);
+#else
+                    stepper_sine = 1;
+#endif
+                }
+                phase_A_position = ((sine_step - 1) * 60) + enter_sine_angle;
                 if (phase_A_position > 359) {
                     phase_A_position -= 360;
                 }
@@ -1316,9 +1541,6 @@ if (!stepper_sine && armed) {
                     phase_C_position -= 360;
                 }
 
-                if (eepromBuffer.use_sine_start == 1) {
-                    stepper_sine = 1;
-                }
                 duty_cycle_setpoint = 0;
             }
         }
@@ -1533,7 +1755,7 @@ void tenKhzRoutine()
               }
               if((brake_countdown == 0) && (zero_throttle_brake_active == 1)){
                 zero_crosses = 0;                          // after countdown forces the brake on stop behavior 
-                running = 0;                               // stops tracking rpm
+                stopCommutation();                               // stops tracking rpm
               }
               zero_throttle_brake_active = 1;
               }
@@ -1633,7 +1855,31 @@ void advanceincrement()
 }
 
 void zcfoundroutine()
-{ // only used in polling mode, blocking routine.
+{
+#ifdef ASYNC_POLLING_COMMUTATION
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (commutation_pending != COM_NONE) {
+        __set_PRIMASK(primask);
+        return;
+    }
+    uint32_t captured_period = INTERVAL_TIMER_COUNT;
+    uint8_t overflow = commutationIntervalOverflowed();
+    if (!commutationCaptureValid(captured_period, overflow)) {
+        /* Do not consume the overflow flag or feed its low bits into IIR. */
+        stopCommutationTimer();
+        __set_PRIMASK(primask);
+        return;
+    }
+    stopCommutationTimer();
+    commutation_pending = COM_POLL;
+    uint32_t epoch = commutation_epoch;
+    thiszctime = (uint16_t)captured_period;
+    resetCommutationInterval(0);
+    __set_PRIMASK(primask);
+    schedulePollingCommutation(epoch);
+#else
+ // only used in polling mode, blocking routine.
     thiszctime = INTERVAL_TIMER_COUNT;
     SET_INTERVAL_TIMER_COUNT(0);
     commutation_interval = (thiszctime + (3 * commutation_interval)) / 4;
@@ -1681,7 +1927,86 @@ void zcfoundroutine()
         }
     }
  #endif
+
+#endif
 }
+
+#ifdef ASYNC_POLLING_COMMUTATION
+static void schedulePollingCommutation(uint32_t epoch)
+{
+    uint32_t interval = (thiszctime + (3 * commutation_interval)) / 4;
+    uint32_t new_advance;
+    uint16_t delay;
+    uint8_t valid_timing = calculateCommutationTiming(interval, temp_advance,
+        &new_advance, &delay);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    /* A mode change can cancel the capture while its delay is calculated. */
+    if (commutation_pending != COM_POLL || epoch != commutation_epoch) {
+        __set_PRIMASK(primask);
+        return;
+    }
+    if (!valid_timing) {
+        stopCommutationTimer();
+        commutation_pending = COM_NONE;
+        __set_PRIMASK(primask);
+        return;
+    }
+    commutation_interval = interval;
+    advance = new_advance;
+    waitTime = delay;
+    if (zero_crosses >= 5 && waitTime != 0) {
+        loadCommutationTimer(waitTime - 1);
+        uint16_t elapsed = INTERVAL_TIMER_COUNT;
+        if (!commutationIntervalOverflowed() && elapsed < waitTime) {
+            startCommutationTimer(elapsed);
+            __set_PRIMASK(primask);
+            return;
+        }
+    }
+    /* This immediate POLL completion has no period calculation. Keep its
+     * owner transaction intact so cancellation cannot replace the event
+     * between deciding it is due and consuming it. */
+    PeriodElapsedCallback();
+    __set_PRIMASK(primask);
+}
+#endif
+
+#ifdef ASYNC_POLLING_COMMUTATION
+static void completePollingCommutation(uint32_t epoch)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (epoch != commutation_epoch) {
+        __set_PRIMASK(primask);
+        return;
+    }
+    bemfcounter = 0;
+    bad_count = 0;
+
+    zero_crosses++;
+#ifdef NO_POLLING_START     // changes to interrupt mode after 2 zero crosses, does not re-enter
+       if (zero_crosses > 2) {
+            old_routine = 0;
+            enableCompInterrupts(); // enable interrupt
+        }
+#else
+    if (eepromBuffer.stall_protection || eepromBuffer.rc_car_reverse) {
+        if (zero_crosses >= 20 && commutation_interval <= 2000) {
+            old_routine = 0;
+            enableCompInterrupts(); // enable interrupt
+        }
+    } else {
+       if (commutation_interval < polling_mode_changeover) {
+            old_routine = 0;
+            enableCompInterrupts(); // enable interrupt
+        }
+    }
+ #endif
+    __set_PRIMASK(primask);
+}
+#endif
+
 #ifdef BRUSHED_MODE
 void runBrushedLoop()
 {
@@ -1991,6 +2316,7 @@ if(zero_crosses < 5){
         }
         if (signaltimeout > (LOOP_FREQUENCY_HZ >> 1)) { // half second timeout when armed;
             if (armed) {
+                stopCommutation();
                 allOff();
                 armed = 0;
                 input = 0;
@@ -2004,6 +2330,7 @@ if(zero_crosses < 5){
                 NVIC_SystemReset();
             }
             if (signaltimeout > LOOP_FREQUENCY_HZ << 1) { // 2 second when not armed
+                stopCommutation();
                 allOff();
                 armed = 0;
                 input = 0;
@@ -2071,12 +2398,23 @@ if(zero_crosses < 5){
         average_interval = e_com_time / 3;
         if (desync_check && zero_crosses > 10) {
             if ((getAbsDif(last_average_interval, average_interval) > average_interval >> 1) && (average_interval < 2000)) { // throttle resitricted before zc 20.
+#ifdef ASYNC_POLLING_COMMUTATION
+                uint32_t primask = __get_PRIMASK();
+                __disable_irq();
+                maskPhaseInterrupts();
+                cancelCommutationLocked();
+#endif
                 zero_crosses = 0;
                 desync_happened++;
                 if ((!eepromBuffer.bi_direction && (input > 47)) || commutation_interval > 1000) {
                     running = 0;
                 }
                 old_routine = 1;
+#ifdef ASYNC_POLLING_COMMUTATION
+                zcfound = 0;
+                bemfcounter = 0;
+                __set_PRIMASK(primask);
+#endif
                 if (zero_crosses > 100) {
                     average_interval = 5000;
                 }
@@ -2198,9 +2536,9 @@ if(zero_crosses < 5){
             if (low_voltage_count > (10000 - (stepper_sine * 9900))) {      // 10 second wait before cut-off for low voltage
               LOW_VOLTAGE_CUTOFF = 1;
               input = 0;
+              stopCommutation();
               allOff();
               maskPhaseInterrupts();
-              running = 0;
               zero_input_count = 0;
               armed = 0;
              }
@@ -2278,6 +2616,43 @@ if(zero_crosses < 5){
                 }
             }
 #endif
+#ifdef ASYNC_POLLING_COMMUTATION
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            uint32_t recovery_period = INTERVAL_TIMER_COUNT;
+            uint8_t overflow = commutationIntervalOverflowed();
+            uint8_t recover_timeout = (overflow || recovery_period > 45000) && running;
+            uint32_t timeout_epoch = commutation_epoch;
+            if (recover_timeout) {
+                maskPhaseInterrupts();
+                cancelCommutationLocked();
+                zero_throttle_brake_active = 0;
+                bemf_timeout_happened++;
+                temp_comp_pwm = eepromBuffer.comp_pwm;
+                old_routine = 1;
+                if (input < 48) {
+                    running = 0;
+                    commutation_interval = 5000;
+                }
+                zero_crosses = 0;
+                zcfound = 1;
+                commutation_pending = COM_POLL;
+                timeout_epoch = commutation_epoch;
+                /* A wrapped counter is not a measurement. Keep the previous
+                 * estimate and perform the original immediate recovery step. */
+                if (!overflow) {
+                    thiszctime = (uint16_t)recovery_period;
+                }
+                resetCommutationInterval(0);
+                if (overflow) {
+                    PeriodElapsedCallback();
+                }
+            }
+            __set_PRIMASK(primask);
+            if (recover_timeout && !overflow) {
+                schedulePollingCommutation(timeout_epoch);
+            }
+#else
             if (INTERVAL_TIMER_COUNT > 45000) {
               zero_throttle_brake_active = 0;   // reset zero throttle brake on back emf timeout (rotation stop)
               if(running){
@@ -2285,15 +2660,18 @@ if(zero_crosses < 5){
                 
                 temp_comp_pwm = eepromBuffer.comp_pwm;
                 maskPhaseInterrupts();
+                cancelCommutation();
                 old_routine = 1;
                 if (input < 48) {
-                    running = 0;
+                    stopCommutation();
                     commutation_interval = 5000;
                 }
                 zero_crosses = 0;
                 zcfoundroutine();
               }
             }
+#endif
+
         } else { // stepper sine
 
 #ifdef GIMBAL_MODE
@@ -2325,6 +2703,7 @@ if(zero_crosses < 5){
 
                     if (do_once_sinemode) {
                         // disable commutation interrupt in case set
+                        cancelCommutation();
                         DISABLE_COM_TIMER_INT();
                         maskPhaseInterrupts();
                         SET_DUTY_CYCLE_ALL(0);
@@ -2347,13 +2726,22 @@ if(zero_crosses < 5){
 
                     delayMicros(step_delay);
                     if (phase_A_position == 0) {
+#ifdef ASYNC_POLLING_COMMUTATION
+                        uint32_t primask = __get_PRIMASK();
+                        __disable_irq();
+#endif
+                        cancelCommutation();
                         stepper_sine = 0;
                         running = 1;
                         old_routine = 1;
                         commutation_interval = 9000;
                         average_interval = 9000;
                         last_average_interval = average_interval;
+#ifdef ASYNC_POLLING_COMMUTATION
+                        resetCommutationInterval(9000);
+#else
                         SET_INTERVAL_TIMER_COUNT(9000);
+#endif
                         zero_crosses = 20;
                         prop_brake_active = 0;
                         step = changeover_step;
@@ -2363,11 +2751,14 @@ if(zero_crosses < 5){
                         }
                         commutate();
                         generatePwmTimerEvent();
+#ifdef ASYNC_POLLING_COMMUTATION
+                        __set_PRIMASK(primask);
+#endif
                     }
                 }
 
             } else {
-                running = 0;
+                stopCommutation();
                 do_once_sinemode = 1;
                 if (eepromBuffer.brake_on_stop == 1) {
 #ifndef PWM_ENABLE_BRIDGE

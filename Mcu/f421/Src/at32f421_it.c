@@ -204,8 +204,10 @@ void TMR14_GLOBAL_IRQHandler(void)
  */
 void TMR16_GLOBAL_IRQHandler(void)
 { 
-    TMR16->ists = 0x00;
-    PeriodElapsedCallback();
+    if ((TMR16->ists & TMR_OVF_FLAG) && (TMR16->iden & TMR_OVF_INT)) {
+        TMR16->ists = (uint16_t)~TMR_OVF_FLAG;
+        PeriodElapsedCallback();
+    }
 }
 
 void TMR15_GLOBAL_IRQHandler(void)

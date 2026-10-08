@@ -348,8 +348,10 @@ void TIM16_IRQHandler(void)
 void TIM14_IRQHandler(void)
 {
     interrupt_time = UTILITY_TIMER->CNT;
-    PeriodElapsedCallback();
-    LL_TIM_ClearFlag_UPDATE(TIM14);
+    if ((TIM14->SR & TIM_SR_UIF) && (TIM14->DIER & TIM_DIER_UIE)) {
+        LL_TIM_ClearFlag_UPDATE(TIM14);
+        PeriodElapsedCallback();
+    }
     interrupt_time = ((uint16_t)UTILITY_TIMER->CNT) - interrupt_time;
 }
 

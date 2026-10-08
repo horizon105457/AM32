@@ -225,8 +225,10 @@ void TIM14_IRQHandler(void)
     /* USER CODE BEGIN TIM14_IRQn 0 */
     if (LL_TIM_IsActiveFlag_UPDATE(TIM14) == 1) {
         interrupt_time = UTILITY_TIMER->CNT;
-        PeriodElapsedCallback();
-        LL_TIM_ClearFlag_UPDATE(TIM14);
+        if (TIM14->DIER & TIM_DIER_UIE) {
+            LL_TIM_ClearFlag_UPDATE(TIM14);
+            PeriodElapsedCallback();
+        }
         interrupt_time = ((uint16_t)UTILITY_TIMER->CNT) - interrupt_time;
     }
     /* USER CODE END TIM14_IRQn 0 */

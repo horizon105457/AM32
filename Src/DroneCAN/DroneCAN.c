@@ -25,6 +25,8 @@
 #include <canard.h>
 #include "phaseouts.h"
 #include "functions.h"
+#include "commutation.h"
+#include "comparator.h"
 #include "filter.h"
 
 // include the headers for the generated DroneCAN messages from the
@@ -469,9 +471,18 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
             last_bi_direction != eepromBuffer.bi_direction) {
             // make dir_reversed and bi_direction change work without
             // reboot
+#ifdef ASYNC_POLLING_COMMUTATION
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            maskPhaseInterrupts();
+            cancelCommutation();
+#endif
             forward = 1 - eepromBuffer.dir_reversed;
             running = 0;
             armed = 0;
+#ifdef ASYNC_POLLING_COMMUTATION
+            __set_PRIMASK(primask);
+#endif
             set_input(0);
         }
 

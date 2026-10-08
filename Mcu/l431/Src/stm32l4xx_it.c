@@ -266,8 +266,10 @@ void TIM1_UP_TIM16_IRQHandler(void)
 	  if(LL_TIM_IsActiveFlag_UPDATE(TIM16) == 1)
 	  {
 
-		PeriodElapsedCallback();
-	    LL_TIM_ClearFlag_UPDATE(TIM16);
+        if (TIM16->DIER & TIM_DIER_UIE) {
+            LL_TIM_ClearFlag_UPDATE(TIM16);
+            PeriodElapsedCallback();
+        }
 
 	  }
 
